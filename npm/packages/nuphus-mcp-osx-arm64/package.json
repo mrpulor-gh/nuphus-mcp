@@ -8,7 +8,7 @@
     "url": "git+https://github.com/mrpulor-gh/nuphus-mcp.git"
   },
   "os": [
-    "osx"
+    "darwin"
   ],
   "cpu": [
     "arm64"

@@ -5,6 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **npm install on macOS** — the `@nuphus/nuphus-mcp-osx-arm64` platform
+  package declared `"os": ["osx"]`, which never matches npm's
+  `process.platform` value on macOS (`"darwin"`), so the optional dependency
+  was skipped with a `notsup` warning and the postinstall check failed. The
+  generated `os` field now uses npm's platform name `"darwin"` (the package
+  name stays `osx-arm64`); the win32/linux packages were already correct.
+
 ## [0.1.10] - 2026-08-07
 
 ### Added

@@ -24,6 +24,13 @@ const PLATFORMS = [
   { platform: 'osx', arch: 'arm64', exe: 'nuphus-mcp' },
 ];
 
+// npm matches a package's `os` field against Node's process.platform, which is
+// "darwin" on macOS — "osx" never matches, so mac users get notsup from the
+// optional dependency. The platform suffix in the package NAME/dir stays "osx"
+// (keeps the published @nuphus/nuphus-mcp-osx-arm64 name stable); only the os
+// FIELD value must be npm's platform name.
+const NPM_OS = { win32: 'win32', linux: 'linux', osx: 'darwin' };
+
 for (const p of PLATFORMS) {
   // Scoped package name — must match the name the meta package depends on.
   // Regression: an unscoped name ("nuphus-mcp-win32-x64") made npm treat each
@@ -41,7 +48,7 @@ for (const p of PLATFORMS) {
       type: 'git',
       url: 'git+https://github.com/mrpulor-gh/nuphus-mcp.git',
     },
-    os: [p.platform],
+    os: [NPM_OS[p.platform]],
     cpu: [p.arch],
     bin: {
       'nuphus-mcp': path.join('bin', p.exe),
