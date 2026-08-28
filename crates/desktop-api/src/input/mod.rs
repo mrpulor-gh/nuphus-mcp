@@ -121,7 +121,9 @@ impl InputEngine {
         #[cfg(windows)]
         {
             use ::windows::Win32::Foundation::HWND;
-            use ::windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+            use ::windows::Win32::UI::WindowsAndMessaging::{
+                IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+            };
             use std::time::Duration;
             use tokio::time::sleep;
 
@@ -133,6 +135,19 @@ impl InputEngine {
 
             let handle = HWND(hwnd);
             unsafe {
+                // 最小化窗口必须先还原再置前——SetForegroundWindow 对 iconic
+                // 窗口不会还原它，后续 is_foreground 判定必然失败（对齐主项目
+                // client.rs window_activate 的实现：还原 + 等动画 + 置前）
+                if IsIconic(handle).as_bool() {
+                    tracing::info!("[activate] hwnd {} is iconic -> SW_RESTORE", hwnd);
+                    let _ = ShowWindow(handle, SW_RESTORE);
+                    // 等待还原动画完成（Windows 通常需要 300-400ms）
+                    sleep(Duration::from_millis(400)).await;
+                    tracing::info!(
+                        "[activate] after restore: IsIconic={}",
+                        IsIconic(handle).as_bool()
+                    );
+                }
                 let _ = SetForegroundWindow(handle);
             }
             sleep(Duration::from_millis(100)).await;
@@ -185,6 +200,8 @@ impl InputEngine {
         unsafe {
             let _ = AttachThreadInput(current_tid, target_tid, true);
             let _ = ShowWindow(handle, SW_RESTORE);
+            // 还原动画完成后再置前，否则 is_foreground 判定必然失败
+            sleep(Duration::from_millis(400)).await;
             let _ = SetForegroundWindow(handle);
             let _ = AttachThreadInput(current_tid, target_tid, false);
         }

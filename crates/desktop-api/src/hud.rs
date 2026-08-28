@@ -32,8 +32,19 @@ pub fn tool_summary(name: &str, args: &serde_json::Value) -> String {
     if let Some(obj) = args.as_object() {
         // 高信息密度字段优先、按固定顺序，避免 JSON 序列化顺序抖动
         for key in [
-            "action", "button", "x", "y", "direction", "amount", "url", "selector",
-            "name", "key", "keys", "path", "title",
+            "action",
+            "button",
+            "x",
+            "y",
+            "direction",
+            "amount",
+            "url",
+            "selector",
+            "name",
+            "key",
+            "keys",
+            "path",
+            "title",
         ] {
             if let Some(v) = obj.get(key) {
                 match v {
@@ -74,18 +85,18 @@ mod imp {
     use ::windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
     use ::windows::Win32::Graphics::Gdi::{
         BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-        GetDC, InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
-        CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CALCRECT,
-        DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_SEMIBOLD, HFONT,
+        GetDC, InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
+        CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CALCRECT, DT_CENTER,
+        DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_SEMIBOLD, HFONT,
         OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
     };
     use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use ::windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics,
         PostMessageW, RegisterClassW, SetLayeredWindowAttributes, SetTimer, SetWindowPos,
-        ShowWindow, CW_USEDEFAULT, HMENU, HWND_TOPMOST, LWA_ALPHA, SM_CXSCREEN, SM_CYSCREEN,
-        SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        TranslateMessage, WM_APP, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        ShowWindow, TranslateMessage, CW_USEDEFAULT, HMENU, HWND_TOPMOST, LWA_ALPHA, SM_CXSCREEN,
+        SM_CYSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP,
+        WM_DESTROY, WM_PAINT, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
         WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
     };
 
@@ -104,7 +115,12 @@ mod imp {
     static HWND_SLOT: AtomicIsize = AtomicIsize::new(-1);
 
     fn slot() -> &'static Mutex<Slot> {
-        SLOT.get_or_init(|| Mutex::new(Slot { text: String::new(), hold_ms: 0 }))
+        SLOT.get_or_init(|| {
+            Mutex::new(Slot {
+                text: String::new(),
+                hold_ms: 0,
+            })
+        })
     }
 
     pub fn show(text: &str, hold_ms: u32) {
@@ -142,8 +158,10 @@ mod imp {
         unsafe {
             let hinstance = hinstance_from(GetModuleHandleW(None).unwrap());
             // w! 宏只接受字面量；类名是 const 变量 → 运行时 UTF-16 编码
-            let class_name: Vec<u16> =
-                CLASS_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+            let class_name: Vec<u16> = CLASS_NAME
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             let class_pcwstr = ::windows::core::PCWSTR(class_name.as_ptr());
             let wc = WNDCLASSW {
                 lpfnWndProc: Some(wndproc),
@@ -209,6 +227,9 @@ mod imp {
                     (s.text.clone(), s.hold_ms)
                 };
                 unsafe {
+                    // 上轮 HOLD_DONE 到点后窗口已被 SW_HIDE——重新显示是必须步骤，
+                    // 否则隐藏窗口收不到 WM_PAINT，HUD 永久消失
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                     layout_and_repaint(hwnd, &text);
                     SetTimer(hwnd, HIDE_TIMER_ID, hold_ms, None);
                 }
@@ -222,6 +243,12 @@ mod imp {
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 }
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                // 句柄槽归位：允许后续 show 重建 HUD 线程（防御性自愈）
+                HWND_SLOT.store(-1, Ordering::Release);
+                unsafe { ::windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) };
                 LRESULT(0)
             }
             _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -239,7 +266,12 @@ mod imp {
         let hdc = GetDC(hwnd);
         let old = SelectObject(hdc, font);
         let mut wide: Vec<u16> = text.encode_utf16().collect();
-        let mut rect = RECT { left: 0, top: 0, right: max_w, bottom: 40 };
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: max_w,
+            bottom: 40,
+        };
         unsafe {
             DrawTextW(hdc, &mut wide, &mut rect, DT_CALCRECT | DT_END_ELLIPSIS);
         }
@@ -252,15 +284,7 @@ mod imp {
         let x = screen_w - text_w - margin * 2;
         let y = screen_h - h - margin * 2;
         unsafe {
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                x,
-                y,
-                text_w + 24,
-                h,
-                SWP_NOACTIVATE,
-            );
+            let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, text_w + 24, h, SWP_NOACTIVATE);
             let _ = InvalidateRect(hwnd, None, true);
         }
     }
@@ -335,7 +359,10 @@ mod tests {
 
     #[test]
     fn summary_prefers_key_fields() {
-        let s = tool_summary("desktop_mouse", &json!({"action":"click","button":"left","x":512,"y":384}));
+        let s = tool_summary(
+            "desktop_mouse",
+            &json!({"action":"click","button":"left","x":512,"y":384}),
+        );
         assert_eq!(s, "desktop_mouse action=click button=left x=512 y=384");
     }
 
@@ -350,6 +377,9 @@ mod tests {
 
     #[test]
     fn summary_empty_args() {
-        assert_eq!(tool_summary("desktop_screen_size", &json!({})), "desktop_screen_size");
+        assert_eq!(
+            tool_summary("desktop_screen_size", &json!({})),
+            "desktop_screen_size"
+        );
     }
 }

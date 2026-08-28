@@ -36,6 +36,8 @@
 | macOS    | Full          | Desktop input requires Accessibility permission (System Settings → Privacy & Security → Accessibility) |
 | Linux    | Available     | Partial — window/input capabilities are limited |
 
+> **Execution HUD**: the on-screen indicator shown while tools run is Windows-only today. On macOS/Linux the HUD is a silent no-op — window activation is never used as a visibility fallback (it steals focus from the user and other agents).
+
 ## API Keys & Local Models
 
 ### Vision — BYOK, OpenAI-compatible or Anthropic native
