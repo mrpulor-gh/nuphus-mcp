@@ -285,14 +285,12 @@ async fn execute_tool_isolated(name: String, args: Value) -> Result<tools::ToolO
             format!("✓ {} ({}ms)", name, start.elapsed().as_millis()),
             desktop_api::hud::HOLD_DONE_MS,
         ),
-        Ok(_) => desktop_api::hud::show(
-            format!("⚠ {} failed", name),
-            desktop_api::hud::HOLD_DONE_MS,
-        ),
-        Err(_) => desktop_api::hud::show(
-            format!("✗ {} error", name),
-            desktop_api::hud::HOLD_DONE_MS,
-        ),
+        Ok(_) => {
+            desktop_api::hud::show(format!("⚠ {} failed", name), desktop_api::hud::HOLD_DONE_MS)
+        }
+        Err(_) => {
+            desktop_api::hud::show(format!("✗ {} error", name), desktop_api::hud::HOLD_DONE_MS)
+        }
     }
     result
 }
