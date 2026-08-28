@@ -1,6 +1,6 @@
 [package]
 name = "nuphus-mcp"
-version = "0.1.13"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/mrpulor-gh/nuphus-mcp"

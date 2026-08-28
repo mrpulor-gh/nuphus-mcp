@@ -1,6 +1,6 @@
 {
   "name": "@nuphus/nuphus-mcp",
-  "version": "0.1.13",
+  "version": "0.2.0",
   "description": "Nuphus MCP server — AI computer operation (desktop + browser tools). Platform binary auto-selected via optionalDependencies.",
   "license": "MIT",
   "repository": {
@@ -23,10 +23,10 @@
     "prepublishOnly": "node ./scripts/check-clean-bin.js"
   },
   "optionalDependencies": {
-    "@nuphus/nuphus-mcp-win32-x64": "0.1.13",
-    "@nuphus/nuphus-mcp-win32-arm64": "0.1.13",
-    "@nuphus/nuphus-mcp-linux-x64": "0.1.13",
-    "@nuphus/nuphus-mcp-linux-arm64": "0.1.13",
-    "@nuphus/nuphus-mcp-osx-arm64": "0.1.13"
+    "@nuphus/nuphus-mcp-win32-x64": "0.2.0",
+    "@nuphus/nuphus-mcp-win32-arm64": "0.2.0",
+    "@nuphus/nuphus-mcp-linux-x64": "0.2.0",
+    "@nuphus/nuphus-mcp-linux-arm64": "0.2.0",
+    "@nuphus/nuphus-mcp-osx-arm64": "0.2.0"
   }
 }
