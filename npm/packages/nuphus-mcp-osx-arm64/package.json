@@ -1,6 +1,6 @@
 {
   "name": "@nuphus/nuphus-mcp-osx-arm64",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "nuphus-mcp binary for osx arm64. Installed automatically by the nuphus-mcp meta package.",
   "license": "MIT",
   "repository": {

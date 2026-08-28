@@ -1,6 +1,6 @@
 {
   "name": "@nuphus/nuphus-mcp-win32-arm64",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "nuphus-mcp binary for win32 arm64. Installed automatically by the nuphus-mcp meta package.",
   "license": "MIT",
   "repository": {
