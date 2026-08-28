@@ -258,8 +258,15 @@ impl McpServer {
 async fn execute_tool_isolated(name: String, args: Value) -> Result<tools::ToolOutput, String> {
     use futures_util::FutureExt;
     let log_name = name.clone();
+    let start = std::time::Instant::now();
+    // HUD 可见性协议：执行前显示「▶ 工具+关键参数」，完成后覆盖为结果态。
+    // 桌面操作目标多为其它应用的窗口，激活窗口做提示是灾难——HUD 浮条是唯一实时通道。
+    desktop_api::hud::show(
+        format!("▶ {}", desktop_api::hud::tool_summary(&name, &args)),
+        desktop_api::hud::HOLD_EXEC_MS,
+    );
     let fut = std::panic::AssertUnwindSafe(tools::execute(&name, &args));
-    match fut.catch_unwind().await {
+    let result = match fut.catch_unwind().await {
         Ok(res) => res,
         Err(payload) => {
             let detail = payload
@@ -272,7 +279,22 @@ async fn execute_tool_isolated(name: String, args: Value) -> Result<tools::ToolO
                 "internal error: tool execution failed unexpectedly; the server is still alive",
             ))
         }
+    };
+    match &result {
+        Ok(out) if !out.is_error => desktop_api::hud::show(
+            format!("✓ {} ({}ms)", name, start.elapsed().as_millis()),
+            desktop_api::hud::HOLD_DONE_MS,
+        ),
+        Ok(_) => desktop_api::hud::show(
+            format!("⚠ {} failed", name),
+            desktop_api::hud::HOLD_DONE_MS,
+        ),
+        Err(_) => desktop_api::hud::show(
+            format!("✗ {} error", name),
+            desktop_api::hud::HOLD_DONE_MS,
+        ),
     }
+    result
 }
 
 #[cfg(test)]

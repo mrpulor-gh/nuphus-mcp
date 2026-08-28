@@ -5,6 +5,7 @@
 pub mod api;
 pub mod clipboard;
 pub mod core;
+pub mod hud;
 pub mod input;
 pub mod platform;
 pub mod utils;
