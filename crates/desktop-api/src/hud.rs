@@ -1,22 +1,58 @@
-//! hud — 工具调用执行提示（非侵入悬浮层）
+//! hud — 工具调用执行提示（非侵入可见性层，跨平台）
 //!
 //! 设计约束（大王定调，2026-08-28）：
-//! - 桌面操作的目标大多是**其它应用的窗口**，且��个 agent 并行共用一个桌面——
+//! - 桌面操作的目标大多是**其它应用的窗口**，且多个 agent 并行共用一个桌面——
 //!   绝不允许用「激活窗口」做执行提示（焦点是用户与其它 agent 的领地）
-//! - HUD 是唯一的实时可见性通道：屏幕右下角小浮条，显示「正在执行什么」
-//! - 非侵入四件套：`WS_EX_NOACTIVATE`（永不抢焦点）+ `WS_EX_TRANSPARENT`
-//!   （鼠标穿透）+ `WS_EX_TOOLWINDOW`（不进任务栏/Alt-Tab）+ `SW_SHOWNOACTIVATE`
-//! - Windows 实现；其它平台 no-op（与 desktop-api 平台策略一致）
+//! - 各平台的非侵入实现：
+//!   - Windows：右下角 OSD 浮条（开始 ▶ / 完成 ✓ 全程实时），Win32 原生窗口
+//!   - macOS：系统通知中心（`osascript display notification`），仅完成态
+//!   - Linux：libnotify（`notify-send`），仅完成态；无桌面环境时静默降级
+//! - 非侵入共性：通知/浮条都**不夺焦点**；激活窗口被明令禁止作为可见性手段
+//! - 开关：环境变量 `NUPHUS_MCP_HUD=off` 一键禁用（默认开启）
+
+use serde_json::Value;
 
 /// 工具执行中浮条驻留时长（防工具 hang 留残影的上限；正常会被完成态覆盖）
 pub const HOLD_EXEC_MS: u32 = 30_000;
-/// 完成态浮条驻留时长（用户瞥一眼的时间��
+/// 完成态浮条驻留时长（用户瞥一眼的时间）
 pub const HOLD_DONE_MS: u32 = 2_500;
+
+/// 提示种类。Windows 浮条两态全程实时显示；macOS/Linux 系统通知**只发
+/// 完成态**——通知是一次性事件，开始态也发会高频轰炸通知中心。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HudKind {
+    /// 工具开始执行（仅 Windows 浮条显示）
+    Start,
+    /// 工具执行完成（所有平台的完成态通道）
+    Done,
+}
+
+fn disabled_by_env() -> bool {
+    std::env::var("NUPHUS_MCP_HUD")
+        .map(|v| v.eq_ignore_ascii_case("off") || v == "0" || v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+}
+
+/// 显示执行提示（非阻塞，线程安全）。`hold_ms` 仅 Windows 浮条使用（自动隐藏）。
+pub fn show(kind: HudKind, text: impl AsRef<str>, hold_ms: u32) {
+    if disabled_by_env() {
+        return;
+    }
+    let text = text.as_ref();
+    #[cfg(windows)]
+    imp::show(kind, text, hold_ms);
+    #[cfg(target_os = "macos")]
+    imp::show(kind, text);
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "windows")))]
+    imp::show(kind, text);
+    #[cfg(not(any(windows, target_os = "macos", all(unix, not(target_os = "windows")))))]
+    let _ = (kind, text, hold_ms);
+}
 
 /// 单行摘要：`▶ desktop_mouse click left (512,384)` 风格。
 /// 参数提炼：优先取 x/y/text/url/button/name 等高信息字段，JSON 全文截断兜底。
 /// 平台无关（纯函数），供 HUD 与测试共用。
-pub fn tool_summary(name: &str, args: &serde_json::Value) -> String {
+pub fn tool_summary(name: &str, args: &Value) -> String {
     const MAX_TAIL: usize = 48;
     let short = |s: &str| -> String {
         let s = s.replace(['\n', '\r'], " ");
@@ -48,13 +84,13 @@ pub fn tool_summary(name: &str, args: &serde_json::Value) -> String {
         ] {
             if let Some(v) = obj.get(key) {
                 match v {
-                    serde_json::Value::String(s) => parts.push(format!("{key}={}", short(s))),
+                    Value::String(s) => parts.push(format!("{key}={}", short(s))),
                     other => parts.push(format!("{key}={other}")),
                 }
             }
         }
         // text 单独处理：输入类工具的核心载荷
-        if let Some(serde_json::Value::String(s)) = obj.get("text") {
+        if let Some(Value::String(s)) = obj.get("text") {
             parts.push(format!("text=\"{}\"", short(s)));
         }
     }
@@ -65,19 +101,11 @@ pub fn tool_summary(name: &str, args: &serde_json::Value) -> String {
     }
 }
 
-/// 显示 HUD（非阻塞，线程安全）。`hold_ms` 后自动隐藏。
-/// 非 Windows 平台为 no-op。
-pub fn show(text: impl AsRef<str>, hold_ms: u32) {
-    #[cfg(windows)]
-    imp::show(text.as_ref(), hold_ms);
-    #[cfg(not(windows))]
-    let _ = (text, hold_ms);
-}
-
-// ───────────────────────── Windows 实现 ─────────────────────────
+// ───────────────────────── Windows 实现（OSD 浮条） ─────────────────────────
 
 #[cfg(windows)]
 mod imp {
+    use super::HudKind;
     use std::sync::atomic::{AtomicIsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
@@ -123,7 +151,7 @@ mod imp {
         })
     }
 
-    pub fn show(text: &str, hold_ms: u32) {
+    pub fn show(kind: HudKind, text: &str, hold_ms: u32) {
         ensure_thread();
         // 等窗口线程建好窗（冷启动 <100ms；超时放弃本次提示，绝不阻塞工具执行）
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
@@ -349,6 +377,64 @@ mod imp {
         hmodule: ::windows::Win32::Foundation::HMODULE,
     ) -> ::windows::Win32::Foundation::HINSTANCE {
         ::windows::Win32::Foundation::HINSTANCE(hmodule.0)
+    }
+}
+
+// ─────────────────── macOS 实现（osascript 系统通知，仅完成态） ───────────────────
+
+#[cfg(target_os = "macos")]
+mod imp {
+    use super::HudKind;
+    use std::process::Command;
+
+    pub fn show(kind: HudKind, text: &str) {
+        // 开始态不发：通知是一次性事件，高频工具会轰炸通知中心
+        if kind == HudKind::Start {
+            return;
+        }
+        // AppleScript 字符串转义（\ 与 "）
+        let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+        // 通知不夺焦点（通知中心横幅/横幅数秒自隐），符合可见性哲学
+        let _ = Command::new("osascript")
+            .args([
+                "-e",
+                &format!(
+                    "display notification \"{}\" with title \"nuphus-mcp\"",
+                    escaped
+                ),
+            ])
+            .output();
+        // 失败静默：通知是辅助通道，绝不影响工具执行
+    }
+}
+
+// ──────────────── Linux 实现（libnotify/notify-send，仅完成态） ────────────────
+
+#[cfg(all(unix, not(target_os = "macos")))]
+mod imp {
+    use super::HudKind;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// notify-send 首次探测失败（无桌面环境/未安装）后置 false，后续调用零开销跳过
+    static AVAILABLE: AtomicBool = AtomicBool::new(true);
+
+    pub fn show(kind: HudKind, text: &str) {
+        if kind == HudKind::Start {
+            return; // 与 macOS 同策略：仅完成态，防轰炸
+        }
+        if !AVAILABLE.load(Ordering::Relaxed) {
+            return;
+        }
+        let ok = Command::new("notify-send")
+            .args(["-a", "nuphus-mcp", "nuphus-mcp", text])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            // 无桌面环境/未装 libnotify → 静默降级，绝不影响工具执行
+            AVAILABLE.store(false, Ordering::Relaxed);
+        }
     }
 }
 
