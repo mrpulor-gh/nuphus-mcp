@@ -118,7 +118,7 @@ fn desktop_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "desktop_window_activate",
-            "Bring a window to the foreground by hwnd. Activate the target window before screenshot/click/input operations, otherwise actions may hit the wrong window or fail.",
+            "Bring a window to the foreground by hwnd. Activate before window ops or actions may hit the wrong window.",
             json_props! {
                 "hwnd" => obj!("type"="integer","description"="Window handle from desktop_windows_list")
             },
@@ -136,7 +136,7 @@ fn desktop_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "desktop_window_move",
-            "Move a window to the specified screen coordinates (Windows: SetWindowPos). Get the hwnd from desktop_windows_list.",
+            "Move a window to screen coordinates (x,y) by hwnd.",
             json_props! {
                 "hwnd" => obj!("type"="integer","description"="Window handle from desktop_windows_list"),
                 "x" => obj!("type"="integer","description"="Target X screen coordinate"),
@@ -146,7 +146,7 @@ fn desktop_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "desktop_window_resize",
-            "Resize a window to the specified width/height (Windows: SetWindowPos, keeps position). Get the hwnd from desktop_windows_list.",
+            "Resize a window to (width,height) by hwnd.",
             json_props! {
                 "hwnd" => obj!("type"="integer","description"="Window handle from desktop_windows_list"),
                 "width" => obj!("type"="integer","description"="New window width in pixels"),
@@ -156,7 +156,7 @@ fn desktop_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "desktop_window_info",
-            "Query detailed window information: title, visibility, minimized/maximized state, window & client rects, process id/name, window class.",
+            "Query detailed window info (title/visibility/state/rects/process/class) by hwnd.",
             json_props! {
                 "hwnd" => obj!("type"="integer","description"="Window handle from desktop_windows_list")
             },
@@ -164,7 +164,7 @@ fn desktop_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "desktop_vision",
-            "Understand a screenshot with a user-configured vision model (BYOK — OpenAI-compatible or Anthropic native). Analyzes UI layout, text content, and icon functions; pass a focused prompt (e.g. \"analyze UI layout\", \"identify all icon functions\") or omit it to extract all text. Requires NUPHUS_MCP_VISION_API_KEY and NUPHUS_MCP_VISION_MODEL; the protocol is auto-detected from NUPHUS_MCP_VISION_BASE_URL (or forced via NUPHUS_MCP_VISION_PROVIDER=openai|anthropic); max output tokens via NUPHUS_MCP_VISION_MAX_TOKENS (default 1024; some providers like Zhipu GLM-4V-Flash cap at 1024); returns a clear error when not configured. If path is omitted, captures the full screen first. ⚠️ Vision coordinates are imprecise — never click with them. Recommended flow: desktop_vision to understand the screen, then desktop_perceive to get exact element coordinates for clicking.",
+            "Understand a screenshot with a vision model (BYOK, OpenAI-compatible/Anthropic). Pass a focused prompt or omit for full text. Requires NUPHUS_MCP_VISION_API_KEY/MODEL; provider from BASE_URL or forced via PROVIDER. Omit path = capture full screen first. ⚠️ Coords imprecise — never click with them; use desktop_perceive for exact coords.",
             json_props! {
                 "path" => obj!("type"="string","description"="Image file path (PNG); omit to capture the full screen first"),
                 "prompt" => obj!("type"="string","description"="Optional instruction for the vision model; defaults to a generic describe-and-read-text prompt")
@@ -173,7 +173,7 @@ fn desktop_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "desktop_perceive",
-            "Locate UI elements in a screenshot with local OCR (PaddleOCR) + optional YOLO icon detection. Downloads OCR models automatically on first run (user data dir). Returns elements with rect{x,y,w,h} and center{x,y}; ALWAYS click using the center coordinate, never rect.x/y (top-left). If path is omitted, captures the full screen first. Recommended flow: desktop_vision first to understand UI semantics, then desktop_perceive to get precise coordinates for clicking. Note: local OCR text may be inaccurate — trust desktop_vision's reading over OCR text.",
+            "Locate UI elements via local OCR (PaddleOCR) + optional YOLO; auto-downloads OCR models on first run. Returns rect{x,y,w,h} + center{x,y}; ALWAYS click center, never rect.x/y. Omit path to capture full screen first. OCR text may be inaccurate — trust desktop_vision.",
             json_props! {
                 "path" => obj!("type"="string","description"="Image file path (PNG); omit to capture the full screen first"),
             },
@@ -206,7 +206,7 @@ fn desktop_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "desktop_input",
-            "Type text into a window (auto UTF-8). Optionally sends a follow-up key — atomic operation. Use clipboard for >500 chars. Activate the target window first.",
+            "Type text into a window (UTF-8), optionally with a follow-up key. Use clipboard for >500 chars. Activate the target window first.",
             json_props! {
                 "mode" => obj!("type"="string","enum"=["type","hotkey"],"description"="type: input text; hotkey: press keys only"),
                 "hwnd" => obj!("type"="integer","description"="Target window handle. Get from desktop_windows_list."),
@@ -218,13 +218,13 @@ fn desktop_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "desktop_clipboard_clean",
-            "Clear the system clipboard. Must be called after pasting sensitive content (passwords/tokens/codes) to prevent residue leaks. For clearing only — do not use to read clipboard.",
+            "Clear the clipboard. Call after pasting sensitive content to prevent residue leaks. Clearing only — do not use to read.",
             json!({}),
             &[],
         ),
         tool_def(
             "desktop_clipboard_write",
-            "Write long text (>500 chars) to the clipboard for pasting. For normal text use desktop_input directly. Call desktop_clipboard_clean after pasting. Never use for passwords/sensitive data.",
+            "Write long text (>500 chars) to clipboard for pasting. Normal text → desktop_input. Clean after pasting. Never for passwords/sensitive data.",
             json_props! {
                 "text" => obj!("type"="string","description"="Text to write")
             },
@@ -246,24 +246,24 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "browser_snapshot",
-            "Get text snapshot of visible interactive elements using Chrome Accessibility Tree. Outputs @N [role] \"name\" format (e.g. @1 [button] \"Submit\"). Falls back to DOM traversal if AX tree unavailable. Use @N refs for click/type.",
+            "Text snapshot of visible interactive elements via AX tree: @N [role] \"name\". Use @N refs for click/type. Falls back to DOM traversal if AX unavailable.",
             json_props! {
                 "full" => obj!("type"="boolean","default"=false,"description"="Include hidden elements too"),
-                "selector" => obj!("type"="string","description"="CSS selector to scope snapshot (e.g. '#quiz', '.main-content'). Only elements within this subtree are numbered.")
+                "selector" => obj!("type"="string","description"="Scope snapshot to this subtree")
             },
             &[],
         ),
         tool_def(
             "browser_exec",
-            "Execute a multi-step batch script in ONE CDP round trip. Use for form filling, multi-click workflows. Script uses `h.click('@N'|'selector')`, `h.fill('@N'|'selector', text)`, `h.scroll(px)`, `h.wait(ms)`, `h.extract('selector')`, `h.snapshot()`. Returns [{op, ref, success, detail}] per step.",
+            "Run multi-step batch script in ONE CDP round trip (form filling, multi-click). Helpers: h.click('@N'|'selector'), h.fill(sel, text), h.scroll(px), h.wait(ms), h.extract(sel), h.snapshot(). Returns [{op, ref, success, detail}] per step.",
             json_props! {
-                "script" => obj!("type"="string","description"="JS script using window.__nuphus helpers (aliased as 'h')")
+                "script" => obj!("type"="string","description"="JS using window.__nuphus helpers (alias 'h')")
             },
             &["script"],
         ),
         tool_def_with_selector_or_ref(
             "browser_click",
-            "Click element by CSS selector or ref ID from snapshot (e.g. @1, @e0, 'button'). CSS selector path auto-waits for the element to appear and become visible (up to 5s) before clicking. Default left clicks are JS-synthesized (reliable, ignore overlays) but do NOT produce user activation; pass trusted=true to dispatch real CDP mouse events (isTrusted=true) instead. Right and middle clicks always use trusted CDP events.",
+            "Click element by CSS selector or @N ref. Auto-waits for visibility (5s). Left clicks default to JS click (no user activation); trusted=true sends real CDP events. Right/middle clicks always trusted.",
             json_props! {
                 "selector" => obj!("type"="string","minLength"=1,"description"="CSS selector or ref ID (e.g. @1, @e0, 'button')"),
                 "ref" => obj!("type"="string","minLength"=1,"description"="Ref ID from snapshot (e.g. @1, @e0); alias of selector — provide either one"),
@@ -275,7 +275,7 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def_with_selector_or_ref(
             "browser_type",
-            "Type text into input field by CSS selector or ref ID from snapshot. CSS selector path auto-waits for the element to appear and become visible (up to 5s) before typing.",
+            "Type text into input by CSS selector or @N ref. Auto-waits for visibility (5s).",
             json_props! {
                 "selector" => obj!("type"="string","minLength"=1,"description"="CSS selector or ref ID of input field (e.g. @1, @e0)"),
                 "ref" => obj!("type"="string","minLength"=1,"description"="Ref ID from snapshot (e.g. @1, @e0); alias of selector — provide either one"),
@@ -285,7 +285,7 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "browser_press",
-            "Press a trusted physical keyboard key or chord on the currently focused page element. Use browser_click or browser_type first when a specific element needs focus. Supports named keys (Enter, Tab, Escape, ArrowUp, PageDown, F1, Space), single US-keyboard characters, and modifier chords such as Control+c, Shift+Tab, or Meta+ArrowLeft. Does not verify a DOM change because terminal/canvas handlers may update outside the DOM.",
+            "Press physical key or chord on focused element (click/type first to focus). Supports named keys, single chars, chords (Control+c, Shift+Tab, Meta+ArrowLeft). Does not verify DOM change (terminal/canvas may update outside DOM).",
             json_props! {
                 "key" => obj!("type"="string","minLength"=1,"description"="Key or chord to press, e.g. Enter, ArrowUp, Control+c, Shift+Tab, Meta+ArrowLeft"),
                 "snapshot" => obj!("type"="boolean","default"=false,"description"="Include a post-key page snapshot. Defaults to false so terminal/canvas state and transient UI are not disturbed.")
@@ -345,7 +345,7 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "browser_wait_for",
-            "Wait for CSS selector to reach the given state on page (up to timeout). Note: browser_click/browser_type CSS path already auto-waits (presence+visible, 5s), so explicit waits are usually only needed for custom states or longer delays.",
+            "Wait for CSS selector to reach a state (up to timeout). Note: click/type already auto-wait 5s; use for custom states or longer delays.",
             json_props! {
                 "selector" => obj!("type"="string","description"="CSS selector to wait for"),
                 "timeout_ms" => obj!("type"="integer","default"=5000,"description"="Max wait time in ms"),
@@ -380,7 +380,7 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "browser_upload",
-            "Upload a file to a file input element using the DataTransfer trick.",
+            "Upload a file to <input type=file>. Use @N ref or CSS selector.",
             json_props! {
                 "selector" => obj!("type"="string","description"="CSS selector or @N ref of file input"),
                 "file_path" => obj!("type"="string","description"="Absolute path to the file to upload")
@@ -389,7 +389,7 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def_with_selector_or_ref(
             "browser_drag_files",
-            "Drag one or more existing local files or directories onto a browser element using native Chrome DevTools drag events. Unlike browser_upload, this does not require an input[type=file] element and does not base64-encode file contents.",
+            "Drag local files/dirs onto a browser element (native CDP drag). Unlike browser_upload, no input[type=file] needed.",
             json_props! {
                 "selector" => obj!("type"="string","minLength"=1,"description"="CSS selector or ref ID of the drop target (e.g. @1, @e0, '.explorer-viewlet')"),
                 "ref" => obj!("type"="string","minLength"=1,"description"="Ref ID from snapshot; alias of selector — provide either one"),
