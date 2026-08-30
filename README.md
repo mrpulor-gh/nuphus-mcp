@@ -255,7 +255,7 @@ responses to stdout. Logs go to stderr.
 echo '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test"}}}' | nuphus-mcp
 ```
 
-## 🔒 Recommended: enable strict confirmation
+### 🔒 Recommended: enable strict confirmation
 
 This server can physically control the machine it runs on. By default write
 tools run **without** confirmation; we strongly recommend enabling strict

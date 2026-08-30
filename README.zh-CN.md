@@ -193,7 +193,7 @@ stderr。
 echo '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test"}}}' | nuphus-mcp
 ```
 
-## 🔒 推荐：开启严格确认（strict confirmation）
+### 🔒 推荐：开启严格确认（strict confirmation）
 
 该 server 能物理控制它所在的机器。默认情况下写工具**不要求确认**即执行；我们
 **强烈建议**开启严格确认，使破坏性操作必须由客户端显式携带 `"confirm": true`
