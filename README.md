@@ -14,6 +14,8 @@ key; local OCR is built in; vision works with your own vision LLM
 > **🇨🇳 Mainland China mirror**: this repo is mirrored on
 > [Gitee](https://gitee.com/nuphus/nuphus-mcp) for fast in-China access
 > (Chinese docs served by default there). [中文文档](README.zh-CN.md)
+>
+> **Part of the Nuphus ecosystem**: [Nuphus](https://github.com/mrpulor-gh/nuphus) — a local-first AI agent with real desktop execution and dual-device (phone-as-second-screen) sync. nuphus-mcp exposes the same desktop + browser automation to any MCP client.
 
 ```
 ┌──────────────────┐   stdio JSON-RPC   ┌──────────────────────┐

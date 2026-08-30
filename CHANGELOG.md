@@ -5,6 +5,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-08-30
+
+### Changed
+
+- **Compacted 17 MCP tool descriptions to short phrases** — key parameters,
+  hard constraints, and behavior contracts preserved, reducing prompt-injection
+  overhead for AI clients.
+
+## [0.2.1] - 2026-08-29
+
+### Added
+
+- **Cross-platform system notifications for the execution HUD** — macOS
+  `osascript` / Linux `notify-send`, so tool-call progress stays visible even
+  when the terminal is not focused.
+
+## [0.2.0] - 2026-08-29
+
+### Added
+
+- **Execution HUD**: non-intrusive floating status bar showing tool-call
+  execution in real time (fades out automatically).
+
+### Fixed
+
+- **HUD disappearing permanently after one show** — the floating bar now stays
+  until the next tool call; minimized-window activation now restores and
+  focuses the window.
+- **Browser**: upgrade a resident headless Chrome instance to headed mode when
+  a headed request arrives.
+- **CI**: EOF newline on `mouse.rs`, bump `h2` for RUSTSEC-2026-0258.
+
 ## [0.1.13] - 2026-08-21
 
 ### Fixed
