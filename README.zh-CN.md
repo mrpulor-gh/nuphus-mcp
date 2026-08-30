@@ -1,5 +1,7 @@
 # nuphus-mcp
 
+[![npm version](https://img.shields.io/npm/v/@nuphus/nuphus-mcp.svg)](https://www.npmjs.com/package/@nuphus/nuphus-mcp) [![npm downloads](https://img.shields.io/npm/dm/@nuphus/nuphus-mcp.svg)](https://www.npmjs.com/package/@nuphus/nuphus-mcp) [![GitHub stars](https://img.shields.io/github/stars/mrpulor-gh/nuphus-mcp.svg)](https://github.com/mrpulor-gh/nuphus-mcp) [![License: MIT](https://img.shields.io/github/license/mrpulor-gh/nuphus-mcp.svg)](LICENSE) [![CI](https://github.com/mrpulor-gh/nuphus-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mrpulor-gh/nuphus-mcp/actions/workflows/ci.yml)
+
 **桌面自动化 MCP Server —— 为任意 AI 智能体提供"计算机使用"能力。看屏幕、控制窗口/键鼠、驱动 Chrome，经 Model Context Protocol（stdio）接入。**
 
 `nuphus-mcp` 是一个轻量、跨平台的**桌面自动化 MCP Server**，把桌面与浏览器自动化能力

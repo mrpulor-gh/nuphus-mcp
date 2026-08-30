@@ -1,5 +1,7 @@
 # nuphus-mcp
 
+[![npm version](https://img.shields.io/npm/v/@nuphus/nuphus-mcp.svg)](https://www.npmjs.com/package/@nuphus/nuphus-mcp) [![npm downloads](https://img.shields.io/npm/dm/@nuphus/nuphus-mcp.svg)](https://www.npmjs.com/package/@nuphus/nuphus-mcp) [![GitHub stars](https://img.shields.io/github/stars/mrpulor-gh/nuphus-mcp.svg)](https://github.com/mrpulor-gh/nuphus-mcp) [![License: MIT](https://img.shields.io/github/license/mrpulor-gh/nuphus-mcp.svg)](LICENSE) [![CI](https://github.com/mrpulor-gh/nuphus-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/mrpulor-gh/nuphus-mcp/actions/workflows/ci.yml)
+
 **Desktop automation MCP server — computer use for any AI agent. See the screen, control windows/mouse/keyboard, and drive Chrome over the Model Context Protocol (stdio). Desktop & browser automation need no API key; OCR runs locally; vision plugs into your own vision LLM (OpenAI-compatible or Anthropic native, BYOK).**
 
 `nuphus-mcp` is a lightweight, cross-platform **desktop automation MCP server**
