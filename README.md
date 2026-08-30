@@ -16,6 +16,8 @@ key; local OCR is built in; vision works with your own vision LLM
 > (Chinese docs served by default there). [中文文档](README.zh-CN.md)
 >
 > **Part of the Nuphus ecosystem**: [Nuphus](https://github.com/mrpulor-gh/nuphus) — a local-first AI agent with real desktop execution and dual-device (phone-as-second-screen) sync. nuphus-mcp exposes the same desktop + browser automation to any MCP client.
+>
+> **Using DeepSeek Harness (DSH)?** nuphus-mcp itself is a plain stdio MCP server — **not** a DSH/Cordis plugin. Install the dedicated [dsh-nuphus-mcp](https://github.com/mrpulor-gh/dsh-nuphus-mcp) plugin instead (see [DeepSeek Harness (DSH)](#deepseek-harness-dsh)).
 
 ```
 ┌──────────────────┐   stdio JSON-RPC   ┌──────────────────────┐

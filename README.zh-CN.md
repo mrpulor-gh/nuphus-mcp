@@ -13,6 +13,8 @@
 > 国内访问更快、默认显示中文文档。GitHub 打不开时用 Gitee。
 >
 > **Nuphus 生态组件**：[Nuphus](https://github.com/mrpulor-gh/nuphus) —— 本地优先的 AI 助手，真实桌面执行力 + 手机第二块屏幕。nuphus-mcp 将同一套桌面/浏览器自动化能力开放给任意 MCP 客户端。
+>
+> **使用 DeepSeek Harness (DSH)？** nuphus-mcp 本体是标准 stdio MCP Server，**不是** DSH/Cordis 插件。请安装专用 [dsh-nuphus-mcp](https://github.com/mrpulor-gh/dsh-nuphus-mcp) 插件（见 [DeepSeek Harness (DSH)](#deepseek-harness-dsh)）。
 
 ```
 ┌──────────────────┐   stdio JSON-RPC   ┌──────────────────────┐
