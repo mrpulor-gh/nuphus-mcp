@@ -22,6 +22,12 @@ const NUPKG_SHA256: &str = "c725e8cefdfe4de08befb9f79b3f218c162439cdcdb97cbbb519
 const SKIP_ENV: &str = "NUPHUS_MCP_NO_ORT_DOWNLOAD";
 /// A valid onnxruntime native library is at least this many bytes; smaller ones are stale.
 const MIN_VALID_SIZE: u64 = 4 * 1024 * 1024;
+/// Per-attempt transfer timeout. The package is ~129 MB; 600s is not enough on a slow
+/// link, and a timeout mid-transfer used to discard the whole download.
+const DOWNLOAD_TIMEOUT_SECS: &str = "1800";
+/// How many resumable transfer rounds one build may make. Each round keeps the bytes
+/// already on disk (`curl -C -`), so this is a retry budget, not a restart budget.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
 
 /// (NuGet RID subdir, native library filenames — [main lib, optional provider-shared lib])
 struct NativeLib {
@@ -111,10 +117,17 @@ fn main() {
     }
 
     let nupkg_cache = profile_dir.join(".nuphus-onnxruntime-1.27.0.nupkg");
-    let nupkg = match ensure_nupkg(&nupkg_cache) {
-        Some(n) => n,
+    let nupkg = match ensure_nupkg(&nupkg_cache, lib.rid, lib.files) {
+        Some((n, trust)) => {
+            if matches!(trust, NupkgTrust::EntriesPresent) {
+                println!(
+                    "cargo:warning=ONNX Runtime: nupkg SHA-256 differs from the pinned value, but every required entry is present; using the cached archive."
+                );
+            }
+            n
+        }
         None => {
-            println!("cargo:warning=ONNX Runtime: could not download the all-platform package; PaddleOCR/YOLO will be unavailable at runtime.");
+            println!("cargo:warning=ONNX Runtime: could not obtain the all-platform package; PaddleOCR/YOLO will be unavailable at runtime.");
             println!(
                 "cargo:warning=  Place `{}` manually next to the exe, or re-run the build with network access.",
                 lib.files[0]
@@ -147,26 +160,72 @@ fn valid_lib_exists(dest: &Path, min_size: u64) -> bool {
         .unwrap_or(false)
 }
 
-/// Download the all-platform nupkg once, verifying its SHA-256. Returns the cached path.
-fn ensure_nupkg(cache: &Path) -> Option<PathBuf> {
-    if cache.exists() && file_size(cache).unwrap_or(0) > 100_000_000 {
-        return Some(cache.to_path_buf());
-    }
-    let _ = std::fs::remove_file(cache);
-    if !download(NUGET_URL, cache) {
-        return None;
-    }
-    // Verify hash (catches truncated downloads / captive-portal HTML pages).
-    match sha256(cache) {
-        Some(h) if h != NUPKG_SHA256 => {
-            println!(
-                "cargo:warning=ONNX Runtime: downloaded nupkg hash mismatch (got {h}); discarding."
-            );
-            let _ = std::fs::remove_file(cache);
-            None
+/// How far a cached / downloaded nupkg can be trusted.
+enum NupkgTrust {
+    /// SHA-256 matches the pinned value.
+    HashMatch,
+    /// SHA-256 differs (stale pin, or a mirror that re-packed the archive) but every
+    /// entry this build needs is present — usable; no need to move 129 MB again.
+    EntriesPresent,
+}
+
+/// Obtain a usable all-platform nupkg: reuse the cache when it verifies, otherwise
+/// download resumably. A partial file is KEPT on disk so the next round (and the next
+/// build) continues from where it stopped instead of restarting from zero.
+fn ensure_nupkg(cache: &Path, rid: &str, files: &[&str]) -> Option<(PathBuf, NupkgTrust)> {
+    if cache.exists() {
+        if sha256(cache).as_deref() == Some(NUPKG_SHA256) {
+            return Some((cache.to_path_buf(), NupkgTrust::HashMatch));
         }
-        _ => Some(cache.to_path_buf()),
+        // Size alone is not completeness: a 129 MB archive truncated to 105 MB still
+        // looks "big enough" while missing whole RID folders.
+        if nupkg_has_entries(cache, rid, files) {
+            return Some((cache.to_path_buf(), NupkgTrust::EntriesPresent));
+        }
+        println!(
+            "cargo:warning=ONNX Runtime: cached nupkg is incomplete ({} bytes, sha256 {}); resuming.",
+            file_size(cache).unwrap_or(0),
+            sha256(cache).unwrap_or_else(|| "n/a".to_string())
+        );
     }
+
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        if download_resumable(NUGET_URL, cache) && sha256(cache).as_deref() == Some(NUPKG_SHA256) {
+            return Some((cache.to_path_buf(), NupkgTrust::HashMatch));
+        }
+        if nupkg_has_entries(cache, rid, files) {
+            return Some((cache.to_path_buf(), NupkgTrust::EntriesPresent));
+        }
+        println!(
+            "cargo:warning=ONNX Runtime: download round {attempt}/{DOWNLOAD_ATTEMPTS} incomplete ({} bytes); resuming.",
+            file_size(cache).unwrap_or(0)
+        );
+    }
+
+    println!(
+        "cargo:warning=ONNX Runtime: no complete nupkg after {DOWNLOAD_ATTEMPTS} rounds (have {} bytes, sha256 {}).",
+        file_size(cache).unwrap_or(0),
+        sha256(cache).unwrap_or_else(|| "n/a".to_string())
+    );
+    None
+}
+
+/// True when the archive lists `runtimes/<rid>/native/<file>` for every requested file.
+///
+/// This stays correct on a truncated archive: `tar` stops at the damage but still prints
+/// the entries it reached, so a partial listing fails the `all()` below. `false` here
+/// means "not usable yet" — never "delete it".
+fn nupkg_has_entries(nupkg: &Path, rid: &str, files: &[&str]) -> bool {
+    let Ok(out) = tar_cmd().arg("-tf").arg(nupkg).output() else {
+        return false;
+    };
+    let listing = String::from_utf8_lossy(&out.stdout);
+    files.iter().all(|file| {
+        let needle = format!("runtimes/{rid}/native/{file}");
+        listing
+            .lines()
+            .any(|line| line.trim().trim_start_matches("./") == needle)
+    })
 }
 
 /// Extract a single file from the nupkg into `dest`.
@@ -242,10 +301,24 @@ fn run_unzip(entry: &str, nupkg: &Path, out_dir: &Path) -> Result<(), ()> {
         .unwrap_or(Err(()))
 }
 
-fn download(url: &str, dest: &Path) -> bool {
-    // Prefer curl (present on Windows 10 1803+); fall back to PowerShell.
+/// Transfer the nupkg, resuming from whatever is already on disk.
+///
+/// `curl -C -` continues a partial file, so a timeout or a killed build costs only the
+/// bytes in flight. The old code deleted the file whenever verification failed, which is
+/// what forced every build to re-download the full package from zero.
+fn download_resumable(url: &str, dest: &Path) -> bool {
+    // curl ships with Windows 10 1803+, macOS and most Linux distributions.
     let ok = Command::new("curl")
-        .args(["-fSL", "--max-time", "600", "-o"])
+        .args([
+            "-fSL",
+            "-C",
+            "-",
+            "--retry",
+            "2",
+            "--max-time",
+            DOWNLOAD_TIMEOUT_SECS,
+            "-o",
+        ])
         .arg(dest)
         .arg(url)
         .output()
@@ -254,15 +327,19 @@ fn download(url: &str, dest: &Path) -> bool {
     if ok {
         return true;
     }
-    let ps = format!(
-        "[Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest -Uri '{url}' -OutFile '{}' -UseBasicParsing",
-        dest.display()
-    );
-    Command::new("powershell")
-        .args(["-NoProfile", "-Command", &ps])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    // curl unavailable and nothing on disk yet → single shot via PowerShell (no resume).
+    if file_size(dest).unwrap_or(0) == 0 {
+        let ps = format!(
+            "[Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest -Uri '{url}' -OutFile '{}' -UseBasicParsing",
+            dest.display()
+        );
+        return Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+    }
+    false
 }
 
 fn file_size(p: &Path) -> Option<u64> {

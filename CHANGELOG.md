@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`client.rs`**: unnecessary `unwrap`; `match` → `unwrap_or_default`.
 - **UIA live-test fixture** — the fixture script is resolved by searching ancestor
   directories, so the live tests also run in the standalone repository layout.
+- **Build script: the ONNX Runtime package download no longer restarts from zero** —
+  transfers resume (`curl -C -`), the per-attempt timeout is raised to 30 minutes,
+  and a partial archive is kept instead of deleted when verification fails. Any
+  interrupted transfer used to discard the whole 129 MB package (so every build
+  re-downloaded it), and a truncated-yet-large cache was then reused forever
+  without ever extracting a library.
 
 ## [0.2.3] - 2026-09-17
 
