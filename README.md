@@ -38,6 +38,15 @@ key; local OCR is built in; vision works with your own vision LLM
   window activate/screenshot/move/resize/info, mouse click/drag/scroll/position,
   keyboard input/hotkey, clipboard write/clean — implemented on the
   `desktop-api` crate (xcap + Win32, no Tauri dependency).
+- **Semantic desktop (Accessibility/UIA)** — 7 tools that drive native UI through
+  the platform accessibility tree instead of pixel coordinates:
+  `desktop_targets_list`, `desktop_target_bind`, `desktop_semantic_observe`,
+  `desktop_semantic_candidate`, `desktop_semantic_execute`,
+  `desktop_semantic_action`, `desktop_verify_state`. One contract —
+  **observe → pick a candidate → execute → verify** — where native window
+  handles, coordinates and platform locators never cross the MCP boundary; the
+  caller only sees opaque ids and stable semantic locators. Backed by Windows UIA
+  and the macOS Accessibility (AX) API.
 - **Computer vision pair**: `desktop_vision` (BYOK — send a screenshot to your
   own vision model via an OpenAI-compatible or Anthropic native API) +
   `desktop_perceive` (local OCR with PaddleOCR, models auto-downloaded on first

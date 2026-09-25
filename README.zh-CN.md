@@ -28,11 +28,17 @@
 
 ## 特性
 
-- **38 个 MCP 工具**（桌面 15 + 浏览器 23）—— 完整参考见
+- **45 个 MCP 工具**（桌面 22 + 浏览器 23）—— 完整参考见
   [TOOLS.md](TOOLS.md) / [TOOLS.zh-CN.md](TOOLS.zh-CN.md)。
 - **桌面自动化**：屏幕分辨率、截图（PNG/base64）、窗口列表、窗口激活/截图/移动/缩放/信息查询、
   鼠标点击/拖拽/滚轮/定位、键盘输入/快捷键、剪贴板写入/清空 —— 基于
   `desktop-api` crate（xcap + Win32），不依赖 Tauri。
+- **语义桌面（Accessibility/UIA）**：7 个工具直接驱动原生 UI 的无障碍树，而非像素坐标：
+  `desktop_targets_list`、`desktop_target_bind`、`desktop_semantic_observe`、
+  `desktop_semantic_candidate`、`desktop_semantic_execute`、`desktop_semantic_action`、
+  `desktop_verify_state`。统一契约 —— **observe → 选候选 → 执行 → 验证**：原生窗口句柄、
+  坐标与平台定位器不跨越 MCP 边界，调用方只看到不透明 id 与稳定语义定位器。
+  Windows 走 UIA，macOS 走 Accessibility（AX）API。
 - **计算机视觉双件套**：`desktop_vision`（BYOK —— 截图发送到你自己的视觉模型，OpenAI
   兼容 API）+ `desktop_perceive`（本地 OCR，PaddleOCR，首次运行自动下载模型；
   可选 YOLO 图标检测）。二者配合让 AI 智能体**同时获得语义理解与像素级精确坐标**
@@ -50,7 +56,7 @@
 ```
 nuphus-mcp/
 ├── Cargo.toml                  # workspace 根
-├── TOOLS.md / TOOLS.zh-CN.md   # 38 工具参考文档
+├── TOOLS.md / TOOLS.zh-CN.md   # 45 工具参考文档
 ├── crates/
 │   ├── nuphus-mcp/             # MCP Server（本仓库产品）
 │   ├── nuphus-browser/         # 浏览器自动化核心（CDP）
@@ -70,7 +76,7 @@ nuphus-mcp/
 | 平台 | 浏览器工具 | 桌面工具 |
 |------|-----------|---------|
 | Windows | 全量 | 全量（Win32 API） |
-| macOS | 全量 | 桌面输入需在「系统设置 → 隐私与安全性 → 辅助功能」中授权 |
+| macOS | 全量 | 语义（AX）+ 鼠标/键盘（需在「系统设置 → 隐私与安全性 → 辅助功能」中授权） |
 | Linux | 可用 | 部分支持——窗口/输入能力受限 |
 
 > **执行 HUD**：全平台非侵入执行反馈——Windows 右下角紧凑状态卡片，锚定工作区（避开任务栏/托盘），执行中 / 完成 / 失败 三态实时显示（样式对齐主项目 HUD），macOS/Linux 完成后发**系统通知**（`NUPHUS_MCP_HUD=off` 关闭）。绝不以激活窗口作为可见性手段。
