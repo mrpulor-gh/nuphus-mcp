@@ -216,16 +216,34 @@ fn ensure_nupkg(cache: &Path, rid: &str, files: &[&str]) -> Option<(PathBuf, Nup
 /// the entries it reached, so a partial listing fails the `all()` below. `false` here
 /// means "not usable yet" — never "delete it".
 fn nupkg_has_entries(nupkg: &Path, rid: &str, files: &[&str]) -> bool {
-    let Ok(out) = tar_cmd().arg("-tf").arg(nupkg).output() else {
-        return false;
+    let needles: Vec<String> = files
+        .iter()
+        .map(|file| format!("runtimes/{rid}/native/{file}"))
+        .collect();
+    let lists_all = |listing: &str| {
+        needles.iter().all(|needle| {
+            listing.lines().any(|line| {
+                line.trim()
+                    .trim_start_matches("./")
+                    .ends_with(needle.as_str())
+            })
+        })
     };
-    let listing = String::from_utf8_lossy(&out.stdout);
-    files.iter().all(|file| {
-        let needle = format!("runtimes/{rid}/native/{file}");
-        listing
-            .lines()
-            .any(|line| line.trim().trim_start_matches("./") == needle)
-    })
+
+    // A truncated archive still prints the entries it reached, so a partial listing
+    // simply fails the check — `false` means "not usable yet", never "delete it".
+    if let Ok(out) = tar_cmd().arg("-tf").arg(nupkg).output() {
+        if lists_all(&String::from_utf8_lossy(&out.stdout)) {
+            return true;
+        }
+    }
+    // Linux ships GNU tar, which cannot read zip at all — `unzip -l` is the same
+    // fallback `extract_native` uses there (the release workflow installs unzip and
+    // deliberately keeps it host-arch for this path).
+    match Command::new("unzip").arg("-l").arg(nupkg).output() {
+        Ok(out) => lists_all(&String::from_utf8_lossy(&out.stdout)),
+        Err(_) => false,
+    }
 }
 
 /// Extract a single file from the nupkg into `dest`.
@@ -347,28 +365,47 @@ fn file_size(p: &Path) -> Option<u64> {
 }
 
 fn sha256(p: &Path) -> Option<String> {
-    let out = Command::new("certutil")
-        .args(["-hashfile"])
-        .arg(p)
-        .arg("SHA256")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    // certutil prints locale-dependent header/footer (GBK on zh-CN systems breaks UTF-8
-    // lossy decoding). Extract only the first run of exactly 64 hex chars instead.
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let mut run = String::new();
-    for ch in raw.chars() {
-        if ch.is_ascii_hexdigit() {
-            run.push(ch);
-            if run.len() == 64 {
-                return Some(run.to_ascii_lowercase());
+    // certutil is Windows-only (`-hashfile <file> SHA256` puts the algorithm last);
+    // `sha256sum` is the Linux tool and `shasum` ships with macOS, both taking the
+    // file last. One code path — no cfg — so every platform compiles and exercises
+    // the same logic. (A cfg-split used to make the check silently degrade to `None`
+    // off Windows, leaving the pinned SHA-256 never actually verified there.)
+    fn run(cmd: &str, args: &[&str], trailing: Option<&str>, path: &Path) -> Option<String> {
+        let mut command = Command::new(cmd);
+        command.args(args).arg(path);
+        if let Some(extra) = trailing {
+            command.arg(extra);
+        }
+        let out = command.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let raw = String::from_utf8_lossy(&out.stdout);
+        if cmd == "certutil" {
+            // certutil prints locale-dependent header/footer (GBK on zh-CN systems
+            // breaks UTF-8 lossy decoding) → take the first run of 64 hex chars.
+            let mut run = String::new();
+            for ch in raw.chars() {
+                if ch.is_ascii_hexdigit() {
+                    run.push(ch);
+                    if run.len() == 64 {
+                        return Some(run.to_ascii_lowercase());
+                    }
+                } else {
+                    run.clear();
+                }
             }
+            None
         } else {
-            run.clear();
+            // `<hash>  <file>`
+            raw.split_whitespace()
+                .next()
+                .filter(|token| token.len() == 64 && token.chars().all(|ch| ch.is_ascii_hexdigit()))
+                .map(|token| token.to_ascii_lowercase())
         }
     }
-    None
+
+    run("certutil", &["-hashfile"], Some("SHA256"), p)
+        .or_else(|| run("sha256sum", &[], None, p))
+        .or_else(|| run("shasum", &["-a", "256"], None, p))
 }
