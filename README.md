@@ -31,7 +31,7 @@ key; local OCR is built in; vision works with your own vision LLM
 
 ## Features
 
-- **38 MCP tools** (15 desktop + 23 browser) — screenshots, window control,
+- **45 MCP tools** (22 desktop + 23 browser) — screenshots, window control,
   mouse/keyboard, Chrome CDP automation, and more — see [TOOLS.md](TOOLS.md) /
   [TOOLS.zh-CN.md](TOOLS.zh-CN.md) for the full reference.
 - **Desktop automation**: screen size, screenshot (PNG/base64), window list,
@@ -60,7 +60,7 @@ key; local OCR is built in; vision works with your own vision LLM
 ```
 nuphus-mcp/
 ├── Cargo.toml                  # workspace root
-├── TOOLS.md / TOOLS.zh-CN.md   # 38-tool reference
+├── TOOLS.md / TOOLS.zh-CN.md   # 45-tool reference
 ├── crates/
 │   ├── nuphus-mcp/             # MCP Server (this repo's product)
 │   ├── nuphus-browser/         # Browser automation core (CDP)
@@ -80,7 +80,7 @@ nuphus-mcp/
 | Platform | Browser tools | Desktop tools |
 |----------|---------------|---------------|
 | Windows  | Full          | Full (Win32 API) |
-| macOS    | Full          | Desktop input requires Accessibility permission (System Settings → Privacy & Security → Accessibility) |
+| macOS    | Full          | Semantic (AX) + mouse/keyboard (Accessibility permission required) |
 | Linux    | Available     | Partial — window/input capabilities are limited |
 
 > **Execution HUD**: non-intrusive execution feedback on every platform — Windows shows a compact status card anchored to the bottom-right of the work area, clear of the taskbar/tray (start / done / fail, real-time, styled after the main app HUD), macOS/Linux post a **system notification** on completion (`NUPHUS_MCP_HUD=off` to disable). Window activation is never used as a visibility fallback.
@@ -386,6 +386,15 @@ This server can physically control the machine it runs on. Read
 TOOLS.md](TOOLS.md#safety-annotations) before deploying. Recommended: run with
 `--confirm-write` (or `NUPHUS_MCP_CONFIRM_WRITE=1`) so write tools require an
 explicit `"confirm": true` argument.
+
+## Contributors
+
+Thanks to the people who have contributed code to this project:
+
+| Contributor | Pull requests | Contribution |
+|-------------|---------------|--------------|
+| [@Steooenwolf-666](https://github.com/Steooenwolf-666) | [#4](https://github.com/mrpulor-gh/nuphus-mcp/pull/4) · [#5](https://github.com/mrpulor-gh/nuphus-mcp/pull/5) · [#6](https://github.com/mrpulor-gh/nuphus-mcp/pull/6) | Native file drag + mouse button support · tool schema/runtime/docs alignment · trusted key press |
+| [@yyyyyyyyiiiii](https://github.com/yyyyyyyyiiiii) | [#3](https://github.com/mrpulor-gh/nuphus-mcp/pull/3) | macOS npm platform package `os` field (`darwin`) |
 
 ## License
 

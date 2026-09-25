@@ -13,12 +13,149 @@ use chromiumoxide::{Command, Method, Page};
 use futures_util::StreamExt;
 use serde::Serialize;
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::chrome_finder::{ensure_profile_dir, find_chrome};
 use super::ChromeError;
+
+// ═══════════════════════════════════════════════════
+// Chrome launch-failure diagnostics
+// ═══════════════════════════════════════════════════
+
+/// Bounded stderr tail kept for launch-failure diagnostics.
+const CHROME_STDERR_MAX_LINES: usize = 16;
+const CHROME_STDERR_MAX_LINE_CHARS: usize = 512;
+
+/// Chrome prints these when the sandbox cannot be initialized (containers,
+/// `root` without `--no-sandbox`, missing setuid helper, restricted namespaces).
+const CHROME_SANDBOX_ERROR_MARKERS: &[&str] = &[
+    "running as root without --no-sandbox",
+    "no usable sandbox",
+    "suid sandbox helper binary was found",
+    "failed to move to new namespace",
+    "failed to unshare",
+    "sandbox initialization failed",
+    "failed to initialize sandbox",
+];
+
+/// Chrome prints these when remote debugging is turned off by policy.
+const CHROME_POLICY_ERROR_MARKERS: &[&str] = &[
+    "remote debugging is disabled by policy",
+    "remote debugging has been disabled by the system administrator",
+    "devtools remote debugging is disallowed",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChromeLaunchFailureKind {
+    SandboxUnavailable,
+    RemoteDebuggingBlocked,
+    Other,
+}
+
+/// Append one stderr line to the bounded tail: control characters are stripped
+/// and the line length is capped, so a pathological browser cannot inflate the
+/// error message or smuggle terminal escapes into it.
+fn push_chrome_stderr(tail: &mut VecDeque<String>, line: &str) {
+    let clean: String = line
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\t')
+        .take(CHROME_STDERR_MAX_LINE_CHARS)
+        .collect();
+    if clean.is_empty() {
+        return;
+    }
+    if tail.len() == CHROME_STDERR_MAX_LINES {
+        tail.pop_front();
+    }
+    tail.push_back(clean);
+}
+
+fn classify_chrome_launch_failure(tail: &VecDeque<String>) -> ChromeLaunchFailureKind {
+    let stderr = tail
+        .iter()
+        .map(|line| line.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if CHROME_SANDBOX_ERROR_MARKERS
+        .iter()
+        .any(|marker| stderr.contains(marker))
+        || (stderr.contains("sandbox") && stderr.contains("operation not permitted"))
+    {
+        return ChromeLaunchFailureKind::SandboxUnavailable;
+    }
+
+    if CHROME_POLICY_ERROR_MARKERS
+        .iter()
+        .any(|marker| stderr.contains(marker))
+        || (stderr.contains("remote-debugging") && stderr.contains("policy"))
+    {
+        return ChromeLaunchFailureKind::RemoteDebuggingBlocked;
+    }
+
+    ChromeLaunchFailureKind::Other
+}
+
+fn relevant_chrome_stderr(tail: &VecDeque<String>, kind: ChromeLaunchFailureKind) -> Option<&str> {
+    tail.iter()
+        .rev()
+        .find(|line| {
+            let line = line.to_ascii_lowercase();
+            match kind {
+                ChromeLaunchFailureKind::SandboxUnavailable => {
+                    CHROME_SANDBOX_ERROR_MARKERS
+                        .iter()
+                        .any(|marker| line.contains(marker))
+                        || line.contains("sandbox")
+                        || line.contains("operation not permitted")
+                }
+                ChromeLaunchFailureKind::RemoteDebuggingBlocked => {
+                    CHROME_POLICY_ERROR_MARKERS
+                        .iter()
+                        .any(|marker| line.contains(marker))
+                        || (line.contains("remote-debugging") && line.contains("policy"))
+                }
+                ChromeLaunchFailureKind::Other => true,
+            }
+        })
+        .map(String::as_str)
+        .or_else(|| tail.back().map(String::as_str))
+}
+
+/// Build the launch error, turning an opaque "no DevTools endpoint" into an
+/// actionable cause when the stderr tail identifies one.
+fn chrome_launch_error(reason: &str, tail: &VecDeque<String>) -> BrowserError {
+    if !tail.is_empty() {
+        tracing::warn!(
+            reason,
+            stderr_tail = %tail.iter().cloned().collect::<Vec<_>>().join(" | "),
+            "Chrome launch failed before exposing a DevTools endpoint"
+        );
+    }
+
+    let kind = classify_chrome_launch_failure(tail);
+    let detail = relevant_chrome_stderr(tail, kind)
+        .map(|line| format!(" Chrome stderr: {line}"))
+        .unwrap_or_default();
+    let message = match kind {
+        ChromeLaunchFailureKind::SandboxUnavailable => format!(
+            "{reason}. Chrome sandbox initialization failed. Headed browser sessions keep the \
+             sandbox enabled and will not retry with --no-sandbox. Run this server in a supported \
+             desktop session, or fix the container / enterprise sandbox policy.{detail}"
+        ),
+        ChromeLaunchFailureKind::RemoteDebuggingBlocked => format!(
+            "{reason}. Chrome remote debugging was blocked by a system or enterprise policy. \
+             Allow remote debugging for the selected browser, then retry.{detail}"
+        ),
+        ChromeLaunchFailureKind::Other if !detail.is_empty() => format!("{reason}.{detail}"),
+        ChromeLaunchFailureKind::Other => reason.to_string(),
+    };
+    BrowserError::Launch(message)
+}
 
 // ═══════════════════════════════════════════════════
 // Custom CDP Command types for domains not covered by chromiumoxide_cdp
@@ -416,9 +553,10 @@ fn collect_interactive_nodes(
             .map(|v| v as u32);
 
         // Include if role is interactive and has a backendNodeId
-        if !role.is_empty() && INTERACTIVE_ROLES.contains(&role) && backend_id.is_some() {
+        let interactive_role = !role.is_empty() && INTERACTIVE_ROLES.contains(&role);
+        if let Some(backend_id) = backend_id.filter(|_| interactive_role) {
             let idx = backend_ids.len() + 1; // 1-based display index
-            backend_ids.push(backend_id.unwrap());
+            backend_ids.push(backend_id);
 
             let name_display = if name.len() > 60 {
                 let boundary = crate::floor_char_boundary(&name, 60);
@@ -499,15 +637,13 @@ fn extract_subtree_children(
             return Some(
                 node.get("children")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().cloned().collect())
+                    .map(|arr| arr.to_vec())
                     .unwrap_or_default(),
             );
         }
         // Recurse into children
         if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
-            if let Some(found) =
-                extract_subtree_children(&children.iter().cloned().collect::<Vec<_>>(), target_id)
-            {
+            if let Some(found) = extract_subtree_children(&children.to_vec(), target_id) {
                 return Some(found);
             }
         }
@@ -1023,7 +1159,7 @@ impl BrowserClient {
         // failure: on Windows, Edge/Chrome can close (re-target) its stderr pipe
         // during startup while the browser keeps running and has already written
         // DevToolsActivePort (issue#2: healthy Edge, healthy port, nuphus saw EOF).
-        let mut stderr_buf = String::new();
+        let mut stderr_tail: VecDeque<String> = VecDeque::with_capacity(CHROME_STDERR_MAX_LINES);
         let mut line = String::new();
         let mut parse_detail = String::new();
         let timeout = tokio::time::sleep(std::time::Duration::from_secs(20));
@@ -1043,7 +1179,7 @@ impl BrowserClient {
                             break None;
                         }
                         Ok(_) => {
-                            stderr_buf.push_str(&line);
+                            push_chrome_stderr(&mut stderr_tail, &line);
                             if let Some(url) = line.trim().strip_prefix("DevTools listening on ") {
                                 break Some(url.to_string());
                             }
@@ -1083,22 +1219,18 @@ impl BrowserClient {
                     Some(url) => url,
                     None => {
                         // No fallback: clean up the child explicitly (do not rely on
-                        // kill_on_drop alone) and report with the captured stderr so
-                        // the failure is actually diagnosable.
+                        // kill_on_drop alone) and report a *classified* failure — the
+                        // stderr tail separates sandbox / enterprise-policy causes from
+                        // the generic case instead of dumping a raw tail.
                         let _ = child.kill().await;
                         let _ = child.wait().await;
-                        let stderr_tail: String = stderr_buf
-                            .chars()
-                            .rev()
-                            .take(500)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect();
-                        return Err(BrowserError::Launch(format!(
-                            "Chrome did not expose a DevTools endpoint: {parse_detail} \
-                             (stderr tail: {stderr_tail:?}); DevToolsActivePort fallback failed too"
-                        )));
+                        return Err(chrome_launch_error(
+                            &format!(
+                                "Chrome did not expose a DevTools endpoint: {parse_detail}; \
+                                 DevToolsActivePort fallback failed too"
+                            ),
+                            &stderr_tail,
+                        ));
                     }
                 }
             }
@@ -2901,7 +3033,7 @@ impl BrowserClient {
 
         cdp(page_guard.evaluate("history.back()")).await?;
 
-        Self::wait_for_url_change(&*page_guard, &before).await?;
+        Self::wait_for_url_change(&page_guard, &before).await?;
 
         let url = cdp(page_guard.url())
             .await
@@ -2923,7 +3055,7 @@ impl BrowserClient {
 
         cdp(page_guard.evaluate("history.forward()")).await?;
 
-        Self::wait_for_url_change(&*page_guard, &before).await?;
+        Self::wait_for_url_change(&page_guard, &before).await?;
 
         let url = cdp(page_guard.url())
             .await
@@ -3437,10 +3569,9 @@ impl BrowserClient {
         // Attach sessions land asynchronously; poll until a page is attachable.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         let first_page = loop {
-            let pages = match cdp(browser_arc.lock().await.pages()).await {
-                Ok(pages) => pages,
-                Err(_) => Vec::new(),
-            };
+            let pages = cdp(browser_arc.lock().await.pages())
+                .await
+                .unwrap_or_default();
             if !pages.is_empty() {
                 // Prefer a real content page: Chrome's startup tab (`about:blank` /
                 // `chrome://new-tab-page`) lists first and would snapshot empty, so skip
@@ -3756,6 +3887,64 @@ fn parse_key_chord(chord: &str) -> Result<(String, i64), BrowserError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chrome_launch_diagnostics_classify_sandbox_failures() {
+        for stderr in [
+            "Running as root without --no-sandbox is not supported.",
+            "No usable sandbox! Update your kernel.",
+            "The SUID sandbox helper binary was found, but is not configured correctly.",
+            "Failed to move to new namespace: Operation not permitted",
+        ] {
+            let mut tail = VecDeque::new();
+            push_chrome_stderr(&mut tail, stderr);
+            push_chrome_stderr(&mut tail, "Chrome shutdown completed");
+            assert_eq!(
+                classify_chrome_launch_failure(&tail),
+                ChromeLaunchFailureKind::SandboxUnavailable
+            );
+            let message = chrome_launch_error("Chrome exited", &tail).to_string();
+            assert!(message.contains("sandbox initialization failed"));
+            assert!(message.contains("will not retry with --no-sandbox"));
+            assert!(message.contains(stderr));
+        }
+    }
+
+    #[test]
+    fn chrome_launch_diagnostics_classify_enterprise_policy() {
+        let mut tail = VecDeque::new();
+        push_chrome_stderr(&mut tail, "Remote debugging is disabled by policy");
+        assert_eq!(
+            classify_chrome_launch_failure(&tail),
+            ChromeLaunchFailureKind::RemoteDebuggingBlocked
+        );
+        let message = chrome_launch_error("Chrome exited", &tail).to_string();
+        assert!(message.contains("system or enterprise policy"));
+        assert!(message.contains("Allow remote debugging"));
+    }
+
+    #[test]
+    fn chrome_launch_diagnostics_keep_other_failures_generic_and_bounded() {
+        let mut tail = VecDeque::new();
+        for index in 0..(CHROME_STDERR_MAX_LINES + 3) {
+            push_chrome_stderr(
+                &mut tail,
+                &format!("ordinary failure {index} {}", "x".repeat(800)),
+            );
+        }
+        assert_eq!(tail.len(), CHROME_STDERR_MAX_LINES);
+        assert!(tail.front().is_some_and(|line| line.contains("failure 3")));
+        assert!(tail
+            .iter()
+            .all(|line| line.chars().count() <= CHROME_STDERR_MAX_LINE_CHARS));
+        assert_eq!(
+            classify_chrome_launch_failure(&tail),
+            ChromeLaunchFailureKind::Other
+        );
+        let message = chrome_launch_error("Chrome exited", &tail).to_string();
+        assert!(message.contains("ordinary failure"));
+        assert!(!message.contains("sandbox initialization failed"));
+    }
 
     // ── Unit tests (no browser) ──
 

@@ -7,8 +7,10 @@
 use base64::Engine;
 use desktop_api::input::{self, InputEngine};
 use desktop_api::platform::WindowManager;
-use desktop_api::{GfxBackend, Scope, Target};
+use desktop_api::{CaptureGeometry, GfxBackend, Scope, Target};
 use serde_json::{json, Value};
+
+use super::semantic;
 
 /// Execute a desktop_* tool, returning a text result.
 pub async fn execute(name: &str, args: &Value) -> Result<String, String> {
@@ -28,6 +30,16 @@ pub async fn execute(name: &str, args: &Value) -> Result<String, String> {
         "desktop_input" => input(args).await,
         "desktop_clipboard_clean" => clipboard_clean().await,
         "desktop_clipboard_write" => clipboard_write(args).await,
+        // Semantic (Accessibility/UIA-first) tools: see `tools/semantic.rs`.
+        // The observation → candidate → execution → verification state lives in
+        // one process-wide backend, so these share it rather than the vision path.
+        "desktop_targets_list" => semantic::execute(name, args).await,
+        "desktop_target_bind" => semantic::execute(name, args).await,
+        "desktop_semantic_observe" => semantic::execute(name, args).await,
+        "desktop_semantic_candidate" => semantic::execute(name, args).await,
+        "desktop_semantic_execute" => semantic::execute(name, args).await,
+        "desktop_semantic_action" => semantic::execute(name, args).await,
+        "desktop_verify_state" => semantic::execute(name, args).await,
         _ => Err(format!("Unknown desktop tool: {}", name)),
     }
 }
@@ -120,25 +132,32 @@ async fn screen_size() -> Result<String, String> {
     Ok(json!({ "width": frame.width, "height": frame.height }).to_string())
 }
 
+/// Parse the optional `region` argument shared by `desktop_screenshot` and
+/// `desktop_perceive` (`{x, y, width, height}` → `Scope::Element`); `None` means
+/// "no region given". Out-of-screen origins are clamped downstream by the capture
+/// itself, which `CaptureGeometry` then reports.
+fn region_scope(args: &Value) -> Option<Scope> {
+    let region = args.get("region")?;
+    if !region.is_object() {
+        return None;
+    }
+    Some(Scope::Element {
+        x: region.get("x").and_then(Value::as_i64).unwrap_or(0) as i32,
+        y: region.get("y").and_then(Value::as_i64).unwrap_or(0) as i32,
+        w: region.get("width").and_then(Value::as_i64).unwrap_or(0) as u32,
+        h: region.get("height").and_then(Value::as_i64).unwrap_or(0) as u32,
+    })
+}
+
 async fn screenshot(args: &Value) -> Result<String, String> {
-    let frame = match args.get("region") {
-        Some(r) if r.is_object() => {
-            let x = r.get("x").and_then(Value::as_i64).unwrap_or(0) as i32;
-            let y = r.get("y").and_then(Value::as_i64).unwrap_or(0) as i32;
-            let w = r.get("width").and_then(Value::as_i64).unwrap_or(0) as u32;
-            let h = r.get("height").and_then(Value::as_i64).unwrap_or(0) as u32;
-            let target = dummy_target();
-            desktop_api::vision::capture::capture(&target, Scope::Element { x, y, w, h })
-                .await
-                .map_err(|e| format!("region capture failed: {}", e))?
-        }
-        _ => {
-            let target = dummy_target();
-            desktop_api::vision::capture::capture(&target, Scope::Fullscreen)
-                .await
-                .map_err(|e| format!("screen capture failed: {}", e))?
-        }
+    let target = dummy_target();
+    let (scope, failure) = match region_scope(args) {
+        Some(scope) => (scope, "region capture failed"),
+        None => (Scope::Fullscreen, "screen capture failed"),
     };
+    let frame = desktop_api::vision::capture::capture(&target, scope)
+        .await
+        .map_err(|e| format!("{}: {}", failure, e))?;
     let png = encode_png(&frame)?;
     let path = args.get("path").and_then(Value::as_str);
     output_png(path, &frame, &png)
@@ -274,7 +293,7 @@ async fn vision(args: &Value) -> Result<String, String> {
     let (image_path, _temp) = match args.get("path").and_then(Value::as_str) {
         Some(p) => (p.to_string(), None),
         None => {
-            let temp = TempCapture::capture().await?;
+            let (temp, _geometry) = TempCapture::capture(Scope::Fullscreen).await?;
             (temp.path().to_string(), Some(temp))
         }
     };
@@ -285,18 +304,32 @@ async fn vision(args: &Value) -> Result<String, String> {
 /// desktop_perceive — local OCR + YOLO element location.
 ///
 /// Auto-downloads PaddleOCR models on first run; missing models with failed downloads → clear error.
-/// Auto-captures a screenshot when `path` is omitted. When the YOLO model is missing, returns OCR-only results and reports it honestly.
+/// Auto-captures a screenshot when `path` is omitted (full screen, or `region` when given) and then
+/// reports elements in *screen* coordinates, so `center` can be clicked as-is; a caller-supplied
+/// `path` has no known screen origin, so its elements stay in image coordinates.
+/// When the YOLO model is missing, returns OCR-only results and reports it honestly.
 async fn perceive(args: &Value) -> Result<String, String> {
     // 1. Ensure models are ready (auto-download missing OCR models)
     let status = crate::models::ensure_models().await?;
 
+    // `path` means "analyse this image", `region` means "capture this area first".
+    if region_scope(args).is_some() && args.get("path").and_then(Value::as_str).is_some() {
+        return Err(
+            "path and region are mutually exclusive: pass path to analyse an existing PNG, or region to capture an area"
+                .to_string(),
+        );
+    }
+
     // 2. Obtain the image to analyze (`_temp` keeps the temp-PNG guard alive
     // until inference completes; the file is deleted on every exit path).
-    let (image_path, _temp) = match args.get("path").and_then(Value::as_str) {
-        Some(p) => (p.to_string(), None),
+    // `geometry` is the screen rectangle of an image we captured ourselves: it is
+    // what turns the model's image-space pixels into clickable screen pixels.
+    let (image_path, geometry, _temp) = match args.get("path").and_then(Value::as_str) {
+        Some(p) => (p.to_string(), None, None),
         None => {
-            let temp = TempCapture::capture().await?;
-            (temp.path().to_string(), Some(temp))
+            let scope = region_scope(args).unwrap_or(Scope::Fullscreen);
+            let (temp, geometry) = TempCapture::capture(scope).await?;
+            (temp.path().to_string(), Some(geometry), Some(temp))
         }
     };
 
@@ -312,12 +345,19 @@ async fn perceive(args: &Value) -> Result<String, String> {
         .elements
         .iter()
         .map(|el| {
-            let center = el.rect.center();
+            let rect = match geometry {
+                Some(geometry) => geometry.rect_to_screen(el.rect),
+                None => el.rect,
+            };
+            let center = match geometry {
+                Some(geometry) => geometry.to_screen(el.rect.center()),
+                None => el.rect.center(),
+            };
             json!({
                 "id": el.id,
                 "kind": format!("{:?}", el.kind).to_lowercase(),
                 "text": el.text,
-                "rect": { "x": el.rect.x, "y": el.rect.y, "w": el.rect.w, "h": el.rect.h },
+                "rect": { "x": rect.x, "y": rect.y, "w": rect.w, "h": rect.h },
                 "center": { "x": center.x, "y": center.y },
                 "confidence": el.confidence,
                 "source": format!("{:?}", el.source).to_lowercase(),
@@ -325,6 +365,13 @@ async fn perceive(args: &Value) -> Result<String, String> {
         })
         .collect();
 
+    // `screen` = rect/center are absolute and safe to click; `image` = they are
+    // relative to the supplied PNG's own top-left pixel (origin unknown).
+    let coordinate_space = if geometry.is_some() {
+        "screen"
+    } else {
+        "image"
+    };
     let mut result = json!({
         "elements": json_elements,
         "count": json_elements.len(),
@@ -332,7 +379,16 @@ async fn perceive(args: &Value) -> Result<String, String> {
         "yolo_count": output.yolo_count,
         "yolo_available": output.yolo_available,
         "models_dir": status.dir.display().to_string(),
+        "coordinate_space": coordinate_space,
     });
+    if let Some(geometry) = geometry {
+        result["geometry"] = json!({
+            "x": geometry.x,
+            "y": geometry.y,
+            "width": geometry.width,
+            "height": geometry.height,
+        });
+    }
     if !output.yolo_available {
         result["yolo_disabled_reason"] = json!(
             "icon_detect.onnx not available (auto-download failed or skipped). OCR-only result. Retry desktop_perceive to re-attempt the download, or set NUPHUS_MCP_YOLO_MODEL_URL for a custom source."
@@ -349,9 +405,10 @@ struct TempCapture {
 }
 
 impl TempCapture {
-    async fn capture() -> Result<Self, String> {
+    /// Capture `scope` into a temp PNG and report the screen rectangle it covers.
+    async fn capture(scope: Scope) -> Result<(Self, CaptureGeometry), String> {
         let target = dummy_target();
-        let frame = desktop_api::vision::capture::capture(&target, Scope::Fullscreen)
+        let (frame, geometry) = desktop_api::vision::capture::capture_with_geometry(&target, scope)
             .await
             .map_err(|e| format!("screen capture failed: {}", e))?;
         let png = encode_png(&frame)?;
@@ -361,9 +418,12 @@ impl TempCapture {
             .unwrap_or(0);
         let path = std::env::temp_dir().join(format!("nuphus_mcp_capture_{}.png", nanos));
         std::fs::write(&path, &png).map_err(|e| format!("save temp capture failed: {}", e))?;
-        Ok(Self {
-            path: path.to_string_lossy().into_owned(),
-        })
+        Ok((
+            Self {
+                path: path.to_string_lossy().into_owned(),
+            },
+            geometry,
+        ))
     }
 
     fn path(&self) -> &str {

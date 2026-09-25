@@ -265,8 +265,8 @@ impl YoloDetector {
         for y in 0..h {
             for x in 0..w {
                 let src_idx = (y * w + x) * 3;
-                data[0 * h * w + y * w + x] = raw[src_idx] as f32 / 255.0;
-                data[1 * h * w + y * w + x] = raw[src_idx + 1] as f32 / 255.0;
+                data[y * w + x] = raw[src_idx] as f32 / 255.0;
+                data[h * w + y * w + x] = raw[src_idx + 1] as f32 / 255.0;
                 data[2 * h * w + y * w + x] = raw[src_idx + 2] as f32 / 255.0;
             }
         }
@@ -299,8 +299,7 @@ impl YoloDetector {
             if !keep[a] {
                 continue;
             }
-            for j in (i + 1)..idx_sort.len() {
-                let b = idx_sort[j];
+            for &b in &idx_sort[i + 1..] {
                 if !keep[b] {
                     continue;
                 }
@@ -313,7 +312,7 @@ impl YoloDetector {
         idx_sort
             .into_iter()
             .filter(|&i| keep[i])
-            .map(|i| detections[i].clone())
+            .map(|i| detections[i])
             .collect()
     }
 

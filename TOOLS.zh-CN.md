@@ -3,7 +3,7 @@
 本文档描述当前 `nuphus-mcp` 构建暴露的全部工具。所有工具与 `tools/list`
 返回的 schema 一致，本文档是权威的人类可读参考。
 
-- **工具总数：38** —— 桌面 15 · 浏览器 23
+- **工具总数：45** —— 桌面 22 · 浏览器 23
 - **协议**：JSON-RPC 2.0 over stdio（换行分隔 JSON）
 - **协议版本**：`2024-11-05`
 - **支持的方法**：`initialize`、`notifications/initialized`、`ping`、`tools/list`、`tools/call`
@@ -15,7 +15,7 @@
 - [安全标注](#安全标注)
 - [调用工具](#调用工具)
 - [视觉与本地模型](#视觉与本地模型)
-- [桌面工具（15）](#桌面工具15)
+- [桌面工具（22）](#桌面工具22)
 - [浏览器工具（23）](#浏览器工具23)
 - [端到端示例](#端到端示例)
 
@@ -25,11 +25,11 @@
 
 每个工具在 `tools/list` 中都带 `annotations` 字段（MCP 规范）。
 
-- **`destructiveHint: true`**（27 个）——写操作，会改变系统或页面状态。客户端
+- **`destructiveHint: true`**（30 个）——写操作，会改变系统或页面状态。客户端
   在调用前应展示确认 UI。
-- **`readOnlyHint: true`**（11 个）——只读操作，可安全自动执行。
+- **`readOnlyHint: true`**（15 个）——只读操作，可安全自动执行。
 
-只读工具（11 个）：
+只读工具（15 个）：
 
 | 工具 |
 |------|
@@ -38,6 +38,10 @@
 | `desktop_window_info` |
 | `desktop_vision` |
 | `desktop_perceive` |
+| `desktop_targets_list` |
+| `desktop_semantic_observe` |
+| `desktop_semantic_candidate` |
+| `desktop_verify_state` |
 | `browser_snapshot` |
 | `browser_extract` |
 | `browser_cookies_get` |
@@ -45,7 +49,7 @@
 | `browser_list_downloads` |
 | `browser_wait_for` |
 
-其余 27 个工具均标注 `destructiveHint`。注意：`desktop_mouse` 在 schema 层面
+其余 30 个工具均标注 `destructiveHint`。注意：`desktop_mouse` 在 schema 层面
 保守标注为 destructive（因为其 `action` 可能是 click/scroll 等写操作）；
 运行时确认检查只把 `action: "position"` 视为只读。`desktop_vision` /
 `desktop_perceive` 是只读工具（读取屏幕）；`desktop_perceive` 首次调用可能
@@ -161,7 +165,7 @@ set NUPHUS_MCP_VISION_MODEL=claude-sonnet-4-5
 
 ---
 
-## 桌面工具（15）
+## 桌面工具（22）
 
 桌面工具控制本机：屏幕、窗口、鼠标、键盘与剪贴板。Windows 上基于 Win32 实现
 （`desktop-api` crate：xcap 截屏 + SendInput）；macOS/Linux 上鼠标键盘回退到
@@ -341,22 +345,33 @@ set NUPHUS_MCP_VISION_MODEL=claude-sonnet-4-5
 
 用**本地 OCR（PaddleOCR）** + 可选 **YOLO 图标检测**定位截图中的 UI 元素。
 首次运行自动下载 OCR 模型（见 [视觉与本地模型](#视觉与本地模型)）。未传
-`path` 时先截全屏。返回元素含 `id`、`kind`（text/button/input/icon）、`text`、
-`rect`、`center`、`confidence` 与 `source`（ocr/yolo/both）。
+`path` 时先截图 —— 默认全屏，传了 `region` 则只截该区域。返回元素含 `id`、
+`kind`（text/button/input/icon）、`text`、`rect`、`center`、`confidence` 与
+`source`（ocr/yolo/both）。
 
 | 参数 | 类型 | 必填 | 默认 | 说明 |
 |------|------|------|------|------|
-| `path` | string | 否 | - | 图片文件路径（PNG）；不传则先截全屏 |
+| `path` | string | 否 | - | 图片文件路径（PNG）；不传则先截图 |
+| `region` | object | 否 | - | 要截取并分析的区域 `{x, y, width, height}`；不传则全屏。与 `path` 互斥 |
 
-**示例**
+**坐标语义**：由工具自己截图时，`rect` 与 `center` 均为**屏幕坐标**，可直接点击
+`center`。`geometry` 返回被分析图像覆盖的屏幕矩形（`{x, y, width, height}`，其中
+`x`/`y` 为图像左上角像素的屏幕位置），`coordinate_space` 为 `"screen"`。起点在屏幕
+外的区域会被裁剪到屏幕内，因此 `geometry.x`/`y` 是实际得到的图像原点、而不一定是
+请求的原点；超出屏幕边缘的区域会被缩短。传入 `path` 时图像屏幕原点未知：坐标相对
+于该 PNG 自身左上角像素，`coordinate_space` 为 `"image"` —— 只有它恰好是 `(0, 0)`
+显示器的全屏截图时才可直接点击。`path` 与 `region` 同时传入会被拒绝。
+
+**示例 —— 截取区域并点击返回结果**
 ```json
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_perceive","arguments":{}}}
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_perceive","arguments":{"region":{"x":200,"y":100,"width":800,"height":600}}}}
 ```
 **返回**
 ```json
-{"elements":[{"id":0,"kind":"button","text":"OK","rect":{"x":10,"y":10,"w":40,"h":20},"center":{"x":30,"y":20},"confidence":0.9,"source":"both"}, ...],"count":42,"ocr_count":30,"yolo_count":12,"yolo_available":true,"models_dir":"C:\\Users\\me\\AppData\\Roaming\\Nuphus\\models"}
+{"elements":[{"id":0,"kind":"button","text":"OK","rect":{"x":210,"y":110,"w":40,"h":20},"center":{"x":230,"y":120},"confidence":0.9,"source":"both"}, ...],"count":42,"ocr_count":30,"yolo_count":12,"yolo_available":true,"models_dir":"C:\\Users\\me\\AppData\\Roaming\\Nuphus\\models","coordinate_space":"screen","geometry":{"x":200,"y":100,"width":800,"height":600}}
 ```
-OCR 模型缺失且下载失败时：`isError: true` + 明确错误与手动下载指引。
+该元素在区域内的位置为 10,20，因此屏幕坐标 = `区域原点 + 图像内位置`。OCR 模型
+缺失且下载失败时：`isError: true` + 明确错误与手动下载指引。
 
 ---
 
@@ -466,6 +481,179 @@ OCR 模型缺失且下载失败时：`isError: true` + 明确错误与手动下�
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_clipboard_write","arguments":{"text":"<长文本>"}}}
 ```
 **返回** `{"written_chars":1234}`
+
+---
+
+### desktop_targets_list
+
+查询本机运行窗口与已登记应用，返回 `app_ref` / `window_ref` 与 `is_self`。请优先
+依据用户任务选择目标：提交任务时前台窗口通常是 Nuphus 本身，**不代表**它就是任务
+目标。
+
+| 名称 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `query` | string | 否 | - | 可选应用名称或窗口标题过滤 |
+| `cursor` | integer | 否 | `0` | 翻页：传入返回的 `next_cursor`，且保持相同 `query` |
+
+**返回**有界目录页，含 `applications[].windows[].window_ref`、`next_cursor`
+与 `is_self`。
+
+**示例**
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_targets_list","arguments":{"query":"editor"}}}
+```
+
+---
+
+### desktop_target_bind
+
+绑定 `desktop_targets_list` 返回的应用/窗口，必要时启动。`auto`/`background`
+不会主动激活已有窗口；`foreground` 可还原并激活。多个窗口时返回候选供选择。
+**写类工具** —— 严格确认模式下需要 `"confirm": true`。
+
+| 名称 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `app_ref` | string | **是** | - | `desktop_targets_list` 返回的应用引用 |
+| `window_ref` | string | 否 | - | 多窗口时选择列表返回的某个引用 |
+| `delivery_mode` | string | 否 | `foreground` | `foreground` / `auto` / `background` |
+| `confirm` | boolean | 否 | - | 严格确认模式下必须为 `true` |
+
+**返回**供后续 `desktop_semantic_observe` 使用的 `target_token`；应用有多个窗口时
+返回候选列表。
+
+**示例**
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_target_bind","arguments":{"app_ref":"app:1a2b3c","confirm":true}}}
+```
+
+---
+
+### desktop_semantic_observe
+
+读取绑定目标的 UI Automation / Accessibility 元素，返回完整 JSON 候选页。未传
+`target_token` 时观察前台窗口。原生句柄、坐标与平台定位器都留在适配器内部，调用方
+只看到不透明候选 ID。翻页时传同次 `observation_token` 与 `next_cursor`，不会重新
+采集。详情与可保存的 `workflow_step` 请用 `desktop_semantic_candidate` 查询。
+
+| 名称 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `goal` | string | 否 | - | 当前桌面任务；仅用于构造和说明有界候选 |
+| `target_token` | string | 否 | - | `desktop_target_bind` 返回的任务目标令牌 |
+| `scope` | string | 否 | `window` | `window` / `menu` |
+| `subtree_id` | string | 否 | - | 本地观察返回的元素/区域 ID |
+| `observation_token` | string | 否 | - | 翻页时传入；此时不改变目标或观察范围 |
+| `cursor` | integer | 否 | `0` | 候选/区域分页位置 |
+| `view` | string | 否 | `candidates` | `candidates` / `regions` |
+| `tree_cursor` | string | 否 | - | `next_tree_cursor` 返回的续读令牌（读取原生树下一批） |
+| `delivery_mode` | string | 否 | `foreground` | `foreground` / `auto` / `background` |
+
+**返回**有界候选页：`observation_token`、`candidates[]`、`control_candidates[]`、
+`regions[]`、`next_cursor`、`next_tree_cursor`、`tree_incomplete` 与观察身份信息。
+
+**示例**
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_semantic_observe","arguments":{"goal":"打开设置"}}}
+```
+
+---
+
+### desktop_semantic_candidate
+
+只读查询同一次观察中某个候选的详情与可保存 `workflow_step`。**请保存返回的稳定
+步骤，不要保存候选 ID 或 token。**
+
+| 名称 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `observation_token` | string | **是** | - | 当前观察返回的令牌 |
+| `candidate_id` | string | **是** | - | 当前观察返回的候选 ID |
+
+**示例**
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_semantic_candidate","arguments":{"observation_token":"obs:1f2e...","candidate_id":"candidate-3"}}}
+```
+
+---
+
+### desktop_semantic_execute
+
+执行 `desktop_semantic_observe` 最近一次返回的某个 `candidate_id`，必须回传同次
+`observation_token`。`SetValue` 候选可附带 `value`，该文本只交给本地执行器，不会
+发送给任何模型。执行前会重新读取 UI 并拒绝过期动作。**不得传坐标、选择器或脚本。**
+**写类工具** —— 严格确认模式下需要 `"confirm": true`。
+
+| 名称 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `observation_token` | string | **是** | - | 最近一次语义观察返回的不可预测短期令牌 |
+| `candidate_id` | string | **是** | - | 最近一次语义观察返回的候选动作 ID |
+| `value` | string | 否 | - | 仅用于 `SetValue` 候选的本地文本（保持原始空白） |
+| `delivery_mode` | string | 否 | 继承观察 | `foreground` / `auto` / `background` |
+| `checked` | boolean | 否 | - | `set_checked` 的目标状态 |
+| `direction` | string | 否 | - | `up` / `down` / `left` / `right` |
+| `amount` | string | 否 | - | `small` / `page` |
+| `confirm` | boolean | 否 | - | 严格确认模式下必须为 `true` |
+
+**返回**`status`、`verification`、`dispatch_state`、`effect`、原生 `receipt`
+与可保存的 `workflow_step`。
+
+**示例**
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_semantic_execute","arguments":{"observation_token":"obs:1f2e...","candidate_id":"candidate-3","confirm":true}}}
+```
+
+---
+
+### desktop_semantic_action
+
+执行已保存工作流中的稳定语义动作。运行时重新绑定目标窗口并解析 `locator`，不依赖
+临时 `observation_token`、`candidate_id`、坐标、选择器或脚本；文本与范围值通过
+`value` 本地传入。**写类工具** —— 严格确认模式下需要 `"confirm": true`。
+
+| 名称 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `locator` | object | **是** | - | 从 `workflow_step` 原样保存的稳定定位器（`app_id` 必填） |
+| `action` | string | **是** | - | `invoke` / `toggle` / `set_checked` / `select` / `expand` / `collapse` / `focus` / `set_value` / `scroll` / `scroll_into_view` / `set_range_value` |
+| `value` | string | 否 | - | 仅用于 `set_value` / `set_range_value`，只交给本地 UIA |
+| `launch_ref` | string | 否 | - | 本地返回的稳定启动引用；不得自行编造 |
+| `delivery_mode` | string | 否 | `foreground` | `foreground` / `auto` / `background` |
+| `checked` | boolean | 否 | - | `set_checked` 的目标状态；已满足时不点击 |
+| `direction` | string | 否 | - | `up` / `down` / `left` / `right` |
+| `amount` | string | 否 | - | `small` / `page` |
+| `completion_policy` | string | 否 | `auto` | `auto` / `verified` / `dispatched` |
+| `expectation` | object | 否 | - | 后置条件 `{locator, condition, expected, value, timeout_ms, stable_samples}`；始终验证且不重发动作 |
+| `confirm` | boolean | 否 | - | 严格确认模式下必须为 `true` |
+
+**返回**`status`、`verification`、`dispatch_state`、`effect`、`receipt` 与
+`business_goal_confirmed`。
+
+**示例**
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_semantic_action","arguments":{"locator":{"app_id":"app:1a2b3c","role":"button","automation_id":"save"},"action":"invoke","confirm":true}}}
+```
+
+---
+
+### desktop_verify_state
+
+只读验证指定窗口/元素的后置条件，可有界等待。返回 `satisfied` / `unsatisfied` /
+`unknown`。不会重发原动作、启动应用或抢前台。
+
+| 名称 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `expectation` | object | **是** | - | `{locator, condition, expected, value, timeout_ms, stable_samples}` |
+| `expectation.locator` | object | **是** | - | 稳定定位器（`app_id` 必填） |
+| `expectation.condition` | string | **是** | - | `exists` / `absent` / `window_exists` / `window_absent` / `focused` / `checked` / `selected` / `expanded` / `value_equals` |
+| `expectation.expected` | boolean | 否 | `true` | 布尔类条件的期望状态 |
+| `expectation.value` | string | 否 | - | `value_equals` 的期望文本 |
+| `expectation.timeout_ms` | integer | 否 | `5000` | 有界等待，上限 `300000` |
+| `expectation.stable_samples` | integer | 否 | `2` | 连续稳定采样次数，`1`–`5` |
+
+**返回**`status`（`satisfied` / `unsatisfied` / `unknown`）、`condition`、
+`reason` 与观察到的版本号。
+
+**示例**
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_verify_state","arguments":{"expectation":{"locator":{"app_id":"app:1a2b3c","role":"check_box","accessible_name":"启用同步"},"condition":"checked","expected":true}}}}
+```
 
 ---
 

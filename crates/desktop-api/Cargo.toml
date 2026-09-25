@@ -6,7 +6,7 @@ license = "MIT"
 repository = "https://github.com/mrpulor-gh/nuphus-mcp"
 authors = ["Nuphus Team"]
 description = "Nuphus desktop control core infrastructure - perceive, find, act, communicate"
-rust-version = "1.78"
+rust-version = "1.82"
 
 [features]
 default = []
@@ -16,6 +16,9 @@ http = ["http-server"]
 [dependencies]
 # Async runtime
 tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
+
+# Async trait objects (semantic desktop core)
+async-trait = "0.1"
 
 # HTTP service
 axum = { version = "0.7", features = ["macros"], optional = true }
@@ -82,9 +85,16 @@ windows = { version = "0.56", features = [
     "Win32_System_LibraryLoader",
     "Win32_Storage_FileSystem",
     "Win32_UI_Shell",
+    "Win32_UI_Accessibility",
+    "Win32_Graphics_Dwm",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
+    "Win32_System_Com",
+    "Win32_System_Registry",
 ] }
 
 [dev-dependencies]
 tokio-test = "0.4"
+# The copied Windows UIA live acceptance tests open real desktop windows, so
+# they must not interleave with each other.
+serial_test = "3"

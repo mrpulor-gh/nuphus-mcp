@@ -153,7 +153,7 @@ fn ensure_nupkg(cache: &Path) -> Option<PathBuf> {
         return Some(cache.to_path_buf());
     }
     let _ = std::fs::remove_file(cache);
-    if !download(&NUGET_URL, cache) {
+    if !download(NUGET_URL, cache) {
         return None;
     }
     // Verify hash (catches truncated downloads / captive-portal HTML pages).

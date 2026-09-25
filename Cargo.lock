@@ -740,6 +740,7 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "async-trait",
  "axum",
  "base64",
  "chrono",
@@ -754,6 +755,7 @@ dependencies = [
  "rusttype",
  "serde",
  "serde_json",
+ "serial_test",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",
@@ -2079,8 +2081,9 @@ dependencies = [
 
 [[package]]
 name = "nuphus-mcp"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
+ "async-trait",
  "base64",
  "desktop-api",
  "dirs",
@@ -2096,6 +2099,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -3187,6 +3191,31 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "serial_test"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "699f4197115b8a7e7ff19c9a315a4bd6fffec26cc4626ef45ecaea389e081c6d"
+dependencies = [
+ "futures-executor",
+ "futures-util",
+ "log",
+ "once_cell",
+ "parking_lot",
+ "serial_test_derive",
+]
+
+[[package]]
+name = "serial_test_derive"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94e153fc76e1c6a068703d6d29c508a0b15c061c4b7e43da59cc097bc342673c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

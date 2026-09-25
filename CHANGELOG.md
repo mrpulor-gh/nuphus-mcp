@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-26
+
+### Added
+
+- **Semantic desktop tool family — 7 new tools** — Accessibility/UIA-first control
+  sharing one contract: **observe → pick a `candidate_id` → execute → verify**.
+  `desktop_targets_list`, `desktop_target_bind`, `desktop_semantic_observe`,
+  `desktop_semantic_candidate`, `desktop_semantic_execute`,
+  `desktop_semantic_action`, `desktop_verify_state`. Native window handles,
+  coordinates and platform locators never cross the MCP boundary — callers only
+  ever see opaque ids and stable semantic locators.
+- **macOS Accessibility (AX) support** for the semantic family alongside the
+  Windows UIA backend — implemented with `std` and hand-written FFI bindings, so
+  no new dependencies are introduced.
+- **`desktop_perceive` gains a `region` argument** — analyse a cropped screen area
+  instead of the whole desktop; results now carry a `coordinate_space` field and
+  screen-space coordinates. `path` and `region` are mutually exclusive.
+
+### Changed
+
+- **Screenshot geometry is validated** — a geometry sample is taken before and
+  after the capture and the frame is rejected when the two disagree, so returned
+  coordinates always describe the frame actually produced. Window/client-area
+  scopes report no geometry instead of guessing an origin they cannot know.
+- **Chrome launch failures are classified** — sandbox and enterprise-policy
+  markers are recognised from Chrome's stderr and surfaced as actionable
+  messages instead of a raw stderr tail.
+
+### Fixed
+
+- **`yolo.rs`**: `erasing_op` (`0 * h * w`, always zero) and `needless_range_loop`.
+- **`client.rs`**: unnecessary `unwrap`; `match` → `unwrap_or_default`.
+- **UIA live-test fixture** — the fixture script is resolved by searching ancestor
+  directories, so the live tests also run in the standalone repository layout.
+
 ## [0.2.3] - 2026-09-17
 
 ### Changed
@@ -51,6 +86,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.13] - 2026-08-21
 
+### Added
+
+- **`browser_press` — real key dispatch** — a new tool that sends physical key
+  events (named keys, single characters and chords such as `Control+c`) to the
+  focused element through CDP `Input.dispatchKeyEvent`; `snapshot` controls
+  whether a post-press page snapshot is attached.
+  ([#6](https://github.com/mrpulor-gh/nuphus-mcp/pull/6) by
+  [@Steooenwolf-666](https://github.com/Steooenwolf-666))
+
 ### Fixed
 
 - **Mouse movement silently "succeeding" without moving the cursor** — `move_to`
@@ -62,6 +106,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a descriptive error instead of a silent success. `drag` propagates the
   same errors instead of swallowing them mid-path.
 
+## [0.1.12] - 2026-08-17
+
+### Added
+
+- **Native file drag onto page elements** — `browser_drag_files` drives the
+  browser's own drag pipeline with real file payloads (CDP
+  `Input.dispatchDragEvent`), so drops land on targets that have no
+  `input[type=file]`; paths must exist and are canonicalized before dispatch.
+  ([#4](https://github.com/mrpulor-gh/nuphus-mcp/pull/4) by
+  [@Steooenwolf-666](https://github.com/Steooenwolf-666))
+- **Mouse button selection for browser clicks** — `browser_click` gains a
+  `button` argument (`left` / `right` / `middle`); right and middle clicks always
+  dispatch real CDP mouse events, and the button mask is carried through the
+  press and cleared on release.
+  ([#4](https://github.com/mrpulor-gh/nuphus-mcp/pull/4) by
+  [@Steooenwolf-666](https://github.com/Steooenwolf-666))
+
+### Changed
+
+- **Tool schemas, runtime checks and docs aligned** — write-tool classification
+  is now a single source of truth shared by the runtime guard and the schema
+  declaration, so the two cannot drift apart; the affected tool schemas and both
+  `TOOLS.md` references were updated to match.
+  ([#5](https://github.com/mrpulor-gh/nuphus-mcp/pull/5) by
+  [@Steooenwolf-666](https://github.com/Steooenwolf-666))
+
 ## [0.1.11] - 2026-08-09
 
 ### Fixed
@@ -72,6 +142,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was skipped with a `notsup` warning and the postinstall check failed. The
   generated `os` field now uses npm's platform name `"darwin"` (the package
   name stays `osx-arm64`); the win32/linux packages were already correct.
+  ([#3](https://github.com/mrpulor-gh/nuphus-mcp/pull/3) by
+  [@yyyyyyyyiiiii](https://github.com/yyyyyyyyiiiii))
 
 ## [0.1.10] - 2026-08-07
 

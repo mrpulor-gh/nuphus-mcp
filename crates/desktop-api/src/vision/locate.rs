@@ -168,6 +168,10 @@ impl Locator {
     }
 
     /// Sliding window difference computation
+    ///
+    /// The geometry parameters are inherent to slide-window matching; mirrors the
+    /// main workspace's clippy policy for this lint.
+    #[allow(clippy::too_many_arguments)]
     fn window_diff(
         frame_pixels: &[u8],
         fw: u32,

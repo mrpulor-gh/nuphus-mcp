@@ -23,6 +23,9 @@ fn is_write_tool_name_only(name: &str) -> bool {
             | "desktop_window_screenshot" | "desktop_window_move" | "desktop_window_resize"
             | "desktop_screenshot" | "desktop_clipboard_write"
             | "desktop_clipboard_clean"
+            // semantic desktop writes: binding may launch/activate an application, and
+            // both execution tools dispatch a native UIA action
+            | "desktop_target_bind" | "desktop_semantic_execute" | "desktop_semantic_action"
             // browser writes
             | "browser_navigate" | "browser_click" | "browser_type" | "browser_press" | "browser_exec"
             | "browser_scroll" | "browser_screenshot" | "browser_close" | "browser_evaluate"
@@ -91,7 +94,13 @@ fn is_read_only_tool(name: &str, args: &Value) -> bool {
         | "desktop_windows_list"
         | "desktop_window_info"
         | "desktop_vision"
-        | "desktop_perceive" => true,
+        | "desktop_perceive"
+        // semantic desktop reads: observation, candidate lookup, target listing and
+        // postcondition verification never change system state
+        | "desktop_targets_list"
+        | "desktop_semantic_observe"
+        | "desktop_semantic_candidate"
+        | "desktop_verify_state" => true,
         "browser_snapshot"
         | "browser_extract"
         | "browser_cookies_get"
@@ -241,7 +250,7 @@ fn in_system_protected_dir(p: &std::path::Path) -> bool {
         if let Some(root) = p.components().next() {
             if let std::path::Component::Prefix(prefix) = root {
                 if let std::path::Prefix::Disk(drive) = prefix.kind() {
-                    let drive_root = format!("{}:\\", (drive as u8 as char).to_ascii_uppercase());
+                    let drive_root = format!("{}:\\", ({ drive } as char).to_ascii_uppercase());
                     if p.starts_with(&drive_root) && p.parent().is_none() {
                         return true;
                     }

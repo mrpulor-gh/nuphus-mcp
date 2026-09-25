@@ -92,6 +92,39 @@ pub fn all_tools() -> Vec<ToolDef> {
     tools
 }
 
+/// Stable semantic locator accepted by `desktop_semantic_action` and by the
+/// `expectation` of `desktop_verify_state`. It is the object returned as
+/// `workflow_step` by `desktop_semantic_observe`; callers save it verbatim.
+fn semantic_locator_schema() -> Value {
+    obj!(
+        "type" = "object",
+        "description" = "Stable semantic locator returned by desktop_semantic_observe's workflow_step and saved unchanged",
+        "properties" = json_props! {
+            "app_id" => obj!("type"="string"),
+            "window_id" => obj!("type"="string","description"="Locally derived stable window identity; preferred over the title hint when present"),
+            "window_title" => obj!("type"="string"),
+            "role" => obj!("type"="string","enum"=["window","button","text_field","check_box","radio_button","list","list_item","menu","menu_item","tab","document","other"]),
+            "automation_id" => obj!("type"="string"),
+            "accessible_name" => obj!("type"="string"),
+            "ancestor_chain" => obj!(
+                "type"="array",
+                "description"="Stable ancestor/row context distinguishing repeated controls; contains no coordinates or runtime handles",
+                "items"=obj!(
+                    "type"="object",
+                    "properties"=json_props! {
+                        "role" => obj!("type"="string","enum"=["window","button","text_field","check_box","radio_button","list","list_item","menu","menu_item","tab","document","other"]),
+                        "automation_id" => obj!("type"="string"),
+                        "accessible_name" => obj!("type"="string")
+                    }
+                )
+            ),
+            "supported_action" => obj!("type"="string","enum"=["invoke","toggle","select","expand","collapse","focus","set_value"]),
+            "ordinal_hint" => obj!("type"="integer","minimum"=0,"maximum"=65535,"description"="Legacy workflow hint; never used to disambiguate")
+        },
+        "required" = ["app_id"]
+    )
+}
+
 /// Desktop tools (via desktop-api)
 fn desktop_tools() -> Vec<ToolDef> {
     vec![
@@ -173,9 +206,10 @@ fn desktop_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "desktop_perceive",
-            "Locate UI elements via local OCR (PaddleOCR) + optional YOLO; auto-downloads OCR models on first run. Returns rect{x,y,w,h} + center{x,y}; ALWAYS click center, never rect.x/y. Omit path to capture full screen first. OCR text may be inaccurate — trust desktop_vision.",
+            "Locate UI elements via local OCR (PaddleOCR) + optional YOLO; auto-downloads OCR models on first run. Returns rect{x,y,w,h} + center{x,y} in SCREEN coordinates when it captures the screen itself (region narrows what is captured), or in image coordinates when path is given; ALWAYS click center, never rect.x/y. OCR text may be inaccurate — trust desktop_vision.",
             json_props! {
-                "path" => obj!("type"="string","description"="Image file path (PNG); omit to capture the full screen first"),
+                "path" => obj!("type"="string","description"="Image file path (PNG); omit to capture the screen first"),
+                "region" => obj!("type"="object","description"="Area to capture and analyse {x,y,width,height}; omit for the full screen. Mutually exclusive with path"),
             },
             &[],
         ),
@@ -229,6 +263,122 @@ fn desktop_tools() -> Vec<ToolDef> {
                 "text" => obj!("type"="string","description"="Text to write")
             },
             &["text"],
+        ),
+        // ─── Semantic (Accessibility/UIA-first) tools ───
+        // Observable contract: observe → pick a candidate_id → execute → verify.
+        // Native handles, coordinates and platform locators never cross this boundary.
+        tool_def(
+            "desktop_targets_list",
+            "List running windows and registered applications as app_ref/window_ref with is_self. Choose the target from the user's task — at task submission the foreground window is usually Nuphus itself and is not necessarily the target.",
+            json_props! {
+                "query" => obj!("type"="string","description"="Optional application name or window title query"),
+                "cursor" => obj!("type"="integer","minimum"=0,"description"="Next page: pass the returned next_cursor with the same query")
+            },
+            &[],
+        ),
+        tool_def(
+            "desktop_target_bind",
+            "Bind an application/window returned by desktop_targets_list, launching it when necessary. auto/background never activate an existing window; foreground may restore and activate it. Multiple windows return candidates to choose from. Returns target_token for later observations. No scripts or arbitrary launch paths.",
+            json_props! {
+                "app_ref" => obj!("type"="string"),
+                "window_ref" => obj!("type"="string","description"="Choose a reference from the list when several windows are open"),
+                "delivery_mode" => obj!("type"="string","enum"=["foreground","auto","background"],
+                    "description"="auto prefers reliable background input and only activates when a native action requires it; background never activates")
+            },
+            &["app_ref"],
+        ),
+        tool_def(
+            "desktop_semantic_observe",
+            "Read the bound target's UIA/Accessibility elements and return a complete JSON candidate page. Without target_token it observes the foreground window. Page with the same observation_token plus next_cursor (no re-capture). Use desktop_semantic_candidate for details and a replayable workflow_step. Candidates may be narrowed with menu or subtree scope — that does not mean native UIA is unavailable.",
+            json_props! {
+                "goal" => obj!("type"="string","description"="Current desktop task; only used to build and describe bounded candidates"),
+                "target_token" => obj!("type"="string","description"="Task target token returned by desktop_target_bind"),
+                "scope" => obj!("type"="string","enum"=["window","menu"],"description"="Default window content; menu reads the menu tree on demand"),
+                "subtree_id" => obj!("type"="string","description"="Element/region id from a local observation; invented selectors are rejected"),
+                "observation_token" => obj!("type"="string","description"="Pass when paging; the target and scope then stay unchanged"),
+                "cursor" => obj!("type"="integer","minimum"=0),
+                "view" => obj!("type"="string","enum"=["candidates","regions"],"description"="Page the same observation as candidates or as regions worth drilling into"),
+                "tree_cursor" => obj!("type"="string","description"="Continuation token from next_tree_cursor; reads the next native tree batch (unlike the candidate cursor, a new observation replaces old candidates)"),
+                "delivery_mode" => obj!("type"="string","enum"=["foreground","auto","background"],
+                    "description"="auto prefers reliable background input and only activates when a native action requires it; background never activates")
+            },
+            &[],
+        ),
+        tool_def(
+            "desktop_semantic_candidate",
+            "Read-only lookup of one candidate's details and its replayable workflow_step from the current observation. Save the returned stable step — never save candidate ids or tokens.",
+            json_props! {
+                "observation_token" => obj!("type"="string"),
+                "candidate_id" => obj!("type"="string")
+            },
+            &["observation_token", "candidate_id"],
+        ),
+        tool_def(
+            "desktop_semantic_execute",
+            "Execute one candidate_id from the most recent desktop_semantic_observe. The matching observation_token must be returned. SetValue candidates may carry value, which is handed only to the local executor and never sent to any model. The UI is re-read before dispatch and stale actions are rejected. Never pass coordinates, selectors or scripts.",
+            json_props! {
+                "observation_token" => obj!("type"="string","description"="Unpredictable short-lived token from the most recent semantic observation"),
+                "candidate_id" => obj!("type"="string","description"="Candidate action id from the most recent semantic observation"),
+                "value" => obj!("type"="string","description"="Local text for a SetValue candidate only; original whitespace is preserved","maxLength"=16384),
+                "delivery_mode" => obj!("type"="string","enum"=["foreground","auto","background"],
+                    "description"="auto prefers reliable background input and only activates when a native action requires it; background never activates"),
+                "checked" => obj!("type"="boolean","description"="Target state for set_checked; when already satisfied nothing is clicked"),
+                "direction" => obj!("type"="string","enum"=["up","down","left","right"]),
+                "amount" => obj!("type"="string","enum"=["small","page"])
+            },
+            &["observation_token", "candidate_id"],
+        ),
+        tool_def(
+            "desktop_semantic_action",
+            "Execute a stable UIA/Accessibility semantic action saved from a workflow. The target window is rebound and the locator re-resolved at run time; no temporary observation_token, candidate_id, coordinates, selectors or scripts are involved. Text and range values are passed locally through value.",
+            json_props! {
+                "locator" => semantic_locator_schema(),
+                "action" => obj!("type"="string","enum"=["invoke","toggle","set_checked","select","expand","collapse","focus","set_value","scroll","scroll_into_view","set_range_value"],"description"="Locally allowed native UIA action"),
+                "value" => obj!("type"="string","description"="For set_value/set_range_value only; text goes only to the local UIA executor","maxLength"=16384),
+                "launch_ref" => obj!("type"="string","description"="Optional stable launch reference returned locally; never invent one"),
+                "delivery_mode" => obj!("type"="string","enum"=["foreground","auto","background"],
+                    "description"="auto prefers reliable background input and only activates when a native action requires it; background never activates"),
+                "checked" => obj!("type"="boolean","description"="Target state for set_checked; when already satisfied nothing is clicked, and legacy toggle keeps its inverting meaning"),
+                "direction" => obj!("type"="string","enum"=["up","down","left","right"]),
+                "amount" => obj!("type"="string","enum"=["small","page"]),
+                "completion_policy" => obj!("type"="string","enum"=["auto","verified","dispatched"],"default"="auto",
+                    "description"="auto lets an ordinary action continue after a dispatched-but-unverifiable result; an observed unmet target state is never reported as success and critical commits still require verification. With expectation present the action is always verified and never re-sent"),
+                "expectation" => obj!(
+                    "type" = "object",
+                    "additionalProperties" = false,
+                    "description" = "Optional postcondition; when present it is always verified and the action is never replayed",
+                    "properties" = json_props! {
+                        "locator" => semantic_locator_schema(),
+                        "condition" => obj!("type"="string","enum"=["exists","absent","window_exists","window_absent","focused","checked","selected","expanded","value_equals"]),
+                        "expected" => obj!("type"="boolean","default"=true),
+                        "value" => obj!("type"="string"),
+                        "timeout_ms" => obj!("type"="integer","minimum"=0,"maximum"=300000,"default"=5000),
+                        "stable_samples" => obj!("type"="integer","minimum"=1,"maximum"=5,"default"=2)
+                    },
+                    "required" = ["locator", "condition"]
+                )
+            },
+            &["locator", "action"],
+        ),
+        tool_def(
+            "desktop_verify_state",
+            "Read-only verification of a window/element postcondition, optionally waiting for a bounded time. Returns satisfied/unsatisfied/unknown. It never re-sends the original action, launches an application or steals focus.",
+            json_props! {
+                "expectation" => obj!(
+                    "type" = "object",
+                    "additionalProperties" = false,
+                    "properties" = json_props! {
+                        "locator" => semantic_locator_schema(),
+                        "condition" => obj!("type"="string","enum"=["exists","absent","window_exists","window_absent","focused","checked","selected","expanded","value_equals"]),
+                        "expected" => obj!("type"="boolean","default"=true),
+                        "value" => obj!("type"="string"),
+                        "timeout_ms" => obj!("type"="integer","minimum"=0,"maximum"=300000,"default"=5000),
+                        "stable_samples" => obj!("type"="integer","minimum"=1,"maximum"=5,"default"=2)
+                    },
+                    "required" = ["locator", "condition"]
+                )
+            },
+            &["expectation"],
         ),
     ]
 }
@@ -461,7 +611,7 @@ mod tests {
         let mut filtered = Map::new();
         if let Some(obj) = args.as_object() {
             for (k, v) in obj {
-                if props.map_or(true, |p| p.contains_key(k)) {
+                if props.is_none_or(|p| p.contains_key(k)) {
                     filtered.insert(k.clone(), v.clone());
                 }
             }
@@ -472,7 +622,7 @@ mod tests {
     #[test]
     fn write_tools_declare_confirm() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 38, "published docs expect 38 total tools");
+        assert_eq!(tools.len(), 45, "published docs expect 45 total tools");
         assert_eq!(
             tools
                 .iter()
@@ -485,8 +635,9 @@ mod tests {
             .iter()
             .filter(|t| is_write_tool_schema(t.name))
             .count();
-        // Regression anchor from issue #1 plus browser_drag_files/browser_press: exactly 27 write tools.
-        assert_eq!(write_count, 27, "expected 27 write tools");
+        // Regression anchor from issue #1 plus browser_drag_files/browser_press, plus
+        // the three semantic desktop writes (target_bind, semantic_execute, semantic_action).
+        assert_eq!(write_count, 30, "expected 30 write tools");
 
         for tool in &tools {
             let props = tool.input_schema["properties"]
@@ -656,8 +807,130 @@ mod tests {
         }
 
         assert_eq!(
-            write_tools_checked, 27,
-            "expected all 27 write tools to be exercised"
+            write_tools_checked, 30,
+            "expected all 30 write tools to be exercised"
         );
+    }
+
+    /// `TOOLS.md` / `TOOLS.zh-CN.md` 必须为每个已注册工具保留 `### <tool>` 章节。
+    ///
+    /// 两份文档在 CONTRIBUTING 里被描述为「由 schema 生成」，但仓库里并没有生成器
+    /// （手工维护）。这条测试把「加了工具忘了改文档」从用户反馈提前成 CI 失败：
+    /// 只要 `all_tools()` 新增工具而文档没跟上，这里就会红。
+    #[test]
+    fn tools_doc_lists_exactly_the_registered_tools() {
+        let registered: std::collections::BTreeSet<&str> =
+            all_tools().iter().map(|t| t.name).collect();
+
+        for (label, doc) in [
+            ("TOOLS.md", include_str!("../../../../TOOLS.md")),
+            ("TOOLS.zh-CN.md", include_str!("../../../../TOOLS.zh-CN.md")),
+        ] {
+            let mut documented: std::collections::BTreeSet<&str> =
+                std::collections::BTreeSet::new();
+            for line in doc.lines().filter(|l| l.starts_with("### ")) {
+                for name in &registered {
+                    if line.contains(name) {
+                        documented.insert(name);
+                    }
+                }
+            }
+            let missing: Vec<&&str> = registered.difference(&documented).collect();
+            assert!(
+                missing.is_empty(),
+                "{label} has no `### <tool>` section for: {missing:?}"
+            );
+        }
+    }
+    /// Contract guard for the semantic desktop tools: the required parameters must
+    /// be exactly the ones the runtime reads, and write classification must drive
+    /// the injected `confirm` declaration.
+    #[test]
+    fn semantic_tool_contracts_match_runtime() {
+        let by_name = |name: &str| {
+            all_tools()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("missing schema for {name}"))
+        };
+
+        for (name, required) in [
+            ("desktop_targets_list", &[][..]),
+            ("desktop_target_bind", &["app_ref"][..]),
+            ("desktop_semantic_observe", &[][..]),
+            (
+                "desktop_semantic_candidate",
+                &["observation_token", "candidate_id"][..],
+            ),
+            (
+                "desktop_semantic_execute",
+                &["observation_token", "candidate_id"][..],
+            ),
+            ("desktop_semantic_action", &["locator", "action"][..]),
+            ("desktop_verify_state", &["expectation"][..]),
+        ] {
+            let tool = by_name(name);
+            let actual: Vec<&str> = tool.input_schema["required"]
+                .as_array()
+                .expect("required must be an array")
+                .iter()
+                .map(|value| value.as_str().expect("required entries are strings"))
+                .collect();
+            assert_eq!(actual, required, "{name}: required parameters must match");
+        }
+
+        // Write tools: bind may launch/activate, and both execution tools dispatch a
+        // native UIA action — so strict-confirm must be able to ask for consent.
+        for name in [
+            "desktop_target_bind",
+            "desktop_semantic_execute",
+            "desktop_semantic_action",
+        ] {
+            assert!(is_write_tool_schema(name), "{name} must be a write tool");
+            assert_eq!(
+                by_name(name).input_schema["properties"]["confirm"]["type"],
+                "boolean",
+                "{name} must declare confirm"
+            );
+        }
+
+        // Read-only tools must stay read-only and must not expose `confirm`.
+        for name in [
+            "desktop_targets_list",
+            "desktop_semantic_observe",
+            "desktop_semantic_candidate",
+            "desktop_verify_state",
+        ] {
+            assert!(!is_write_tool_schema(name), "{name} must be read-only");
+            assert!(
+                by_name(name).input_schema["properties"]
+                    .get("confirm")
+                    .is_none(),
+                "{name} must not declare confirm"
+            );
+        }
+
+        // Locator/expectation contract used by the saved-workflow path.
+        let action = by_name("desktop_semantic_action");
+        assert_eq!(
+            action.input_schema["properties"]["locator"]["required"],
+            json!(["app_id"])
+        );
+        assert_eq!(
+            action.input_schema["properties"]["expectation"]["required"],
+            json!(["locator", "condition"])
+        );
+        let verify = by_name("desktop_verify_state");
+        assert_eq!(
+            verify.input_schema["properties"]["expectation"]["required"],
+            json!(["locator", "condition"])
+        );
+        // A saved action must never accept coordinates or raw selectors.
+        for forbidden in ["x", "y", "hwnd", "selector", "script"] {
+            assert!(
+                action.input_schema["properties"].get(forbidden).is_none(),
+                "desktop_semantic_action must not accept `{forbidden}`"
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "nuphus-mcp"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/mrpulor-gh/nuphus-mcp"
@@ -47,3 +47,10 @@ futures-util = "0.3"
 # Download integrity (model file SHA-256 verification)
 sha2 = "0.10"
 hex = "0.4"
+
+# Observation tokens for the semantic desktop tools (unguessable, observation-bound)
+uuid = { version = "1.8", features = ["v4"] }
+
+[dev-dependencies]
+# Fake semantic adapters in tools/semantic.rs tests implement the async traits
+async-trait = "0.1"

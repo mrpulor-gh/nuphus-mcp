@@ -8,6 +8,7 @@ pub mod core;
 pub mod hud;
 pub mod input;
 pub mod platform;
+pub mod semantic;
 pub mod utils;
 pub mod vision;
 

@@ -4,7 +4,7 @@ This document describes every tool exposed by the current `nuphus-mcp` build.
 All tools are defined by the MCP Server's `tools/list` response; this document
 is the authoritative human-readable reference.
 
-- **Total tools: 38** — Desktop: 15 · Browser: 23
+- **Total tools: 45** — Desktop: 22 · Browser: 23
 - **Protocol**: JSON-RPC 2.0 over stdio (newline-delimited JSON)
 - **Protocol version**: `2024-11-05`
 - **Supported methods**: `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`
@@ -16,7 +16,7 @@ is the authoritative human-readable reference.
 - [Safety Annotations](#safety-annotations)
 - [Calling a Tool](#calling-a-tool)
 - [Vision & Local Models](#vision--local-models)
-- [Desktop Tools (15)](#desktop-tools-15)
+- [Desktop Tools (22)](#desktop-tools-22)
 - [Browser Tools (23)](#browser-tools-23)
 - [End-to-End Example](#end-to-end-example)
 
@@ -26,11 +26,11 @@ is the authoritative human-readable reference.
 
 Every tool carries an `annotations` field in `tools/list` (MCP spec).
 
-- **`destructiveHint: true`** (27 tools) — write operations that change system or
+- **`destructiveHint: true`** (30 tools) — write operations that change system or
   page state. Clients SHOULD surface a confirmation UI before invoking these.
-- **`readOnlyHint: true`** (11 tools) — read-only operations, safe to auto-run.
+- **`readOnlyHint: true`** (15 tools) — read-only operations, safe to auto-run.
 
-Read-only tools (11):
+Read-only tools (15):
 
 | Tool |
 |------|
@@ -39,6 +39,10 @@ Read-only tools (11):
 | `desktop_window_info` |
 | `desktop_vision` |
 | `desktop_perceive` |
+| `desktop_targets_list` |
+| `desktop_semantic_observe` |
+| `desktop_semantic_candidate` |
+| `desktop_verify_state` |
 | `browser_snapshot` |
 | `browser_extract` |
 | `browser_cookies_get` |
@@ -46,7 +50,7 @@ Read-only tools (11):
 | `browser_list_downloads` |
 | `browser_wait_for` |
 
-All other tools (27) are marked `destructiveHint`. Note: `desktop_mouse` is
+All other tools (30) are marked `destructiveHint`. Note: `desktop_mouse` is
 conservatively annotated destructive at the schema level because its `action`
 may be `click`/`scroll`/etc. At runtime the confirmation check treats only
 `action: "position"` as read-only. `desktop_vision` / `desktop_perceive` are
@@ -175,7 +179,13 @@ semantics, perceive for precision*.
 
 ---
 
-## Desktop Tools (15)
+## Desktop Tools (22)
+
+This section covers coordinate/vision tools and the semantic
+(Accessibility/UIA-first) tool family. The semantic tools follow one observable
+contract: **observe → pick a `candidate_id` → execute → verify**. Native window
+handles, coordinates and platform locators never cross the MCP boundary; the
+caller only ever sees opaque ids and stable semantic locators.
 
 Desktop tools control the local machine: screen, windows, mouse, keyboard and
 clipboard. On Windows they are implemented on Win32 via the `desktop-api`
@@ -363,25 +373,39 @@ screen is captured first.
 
 Locate UI elements in a screenshot with **local OCR (PaddleOCR)** + optional
 **YOLO icon detection**. Downloads OCR models automatically on first run (see
-[Vision & Local Models](#vision--local-models)). If `path` is omitted the full
-screen is captured first. Returns elements with `id`, `kind` (text/button/
-input/icon), `text`, `rect`, `center`, `confidence` and `source`
-(ocr/yolo/both).
+[Vision & Local Models](#vision--local-models)). If `path` is omitted the screen
+is captured first — the full screen by default, or only `region` when given.
+Returns elements with `id`, `kind` (text/button/input/icon), `text`, `rect`,
+`center`, `confidence` and `source` (ocr/yolo/both).
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
-| `path` | string | no | - | Image file path (PNG); omit to capture the full screen first |
+| `path` | string | no | - | Image file path (PNG); omit to capture the screen first |
+| `region` | object | no | - | Capture area `{x, y, width, height}` to analyse; omit for the full screen. Mutually exclusive with `path` |
 
-**Example**
+**Coordinate semantics.** When the tool captures the screen itself, `rect` and
+`center` are **screen coordinates** — click `center` as-is. `geometry` reports the
+screen rectangle the analysed image covers (`{x, y, width, height}`; `x`/`y` is the
+screen position of the image's top-left pixel) and `coordinate_space` is
+`"screen"`. A region starting off-screen is clamped onto it, so `geometry.x`/`y` is
+the origin you actually got rather than the one you asked for, and a region
+reaching past the screen edge is shortened. With `path`, the image's screen origin
+is unknown: coordinates stay relative to that PNG's own top-left pixel and
+`coordinate_space` is `"image"` — only click them if it is a full-screen capture of
+a monitor at `(0, 0)`. Passing `path` and `region` together is rejected as
+contradictory.
+
+**Example — capture a region, then click what it returned**
 ```json
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_perceive","arguments":{}}}
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_perceive","arguments":{"region":{"x":200,"y":100,"width":800,"height":600}}}}
 ```
 **Returns**
 ```json
-{"elements":[{"id":0,"kind":"button","text":"OK","rect":{"x":10,"y":10,"w":40,"h":20},"center":{"x":30,"y":20},"confidence":0.9,"source":"both"}, ...],"count":42,"ocr_count":30,"yolo_count":12,"yolo_available":true,"models_dir":"C:\\Users\\me\\AppData\\Roaming\\Nuphus\\models"}
+{"elements":[{"id":0,"kind":"button","text":"OK","rect":{"x":210,"y":110,"w":40,"h":20},"center":{"x":230,"y":120},"confidence":0.9,"source":"both"}, ...],"count":42,"ocr_count":30,"yolo_count":12,"yolo_available":true,"models_dir":"C:\\Users\\me\\AppData\\Roaming\\Nuphus\\models","coordinate_space":"screen","geometry":{"x":200,"y":100,"width":800,"height":600}}
 ```
-When OCR models are missing and the download fails: `isError: true` with a
-clear message and manual download instructions.
+The element sits 10,20 into the region, so its screen coordinates are
+`region origin + image position`. When OCR models are missing and the download
+fails: `isError: true` with a clear message and manual download instructions.
 
 ---
 
@@ -496,6 +520,190 @@ pasting, MUST call `desktop_clipboard_clean` to clear residue.
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_clipboard_write","arguments":{"text":"<long text>"}}}
 ```
 **Returns** `{"written_chars":1234}`
+
+---
+
+### desktop_targets_list
+
+List running windows and registered applications as `app_ref` / `window_ref`
+pairs plus `is_self`. Choose the target from the user's task: at task submission
+the foreground window is usually Nuphus itself and is **not** necessarily the
+target.
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `query` | string | no | - | Application-name or window-title filter |
+| `cursor` | integer | no | `0` | Next page: pass the returned `next_cursor` with the same `query` |
+
+**Returns** a bounded catalog page with `applications[].windows[].window_ref`,
+`next_cursor` and `is_self`.
+
+**Example**
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_targets_list","arguments":{"query":"editor"}}}
+```
+
+---
+
+### desktop_target_bind
+
+Bind an application/window returned by `desktop_targets_list`, launching it when
+necessary. `auto`/`background` never activate an existing window; `foreground`
+may restore and activate it. Several open windows return candidates to choose
+from. **Write tool** — requires `"confirm": true` in strict confirm mode.
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `app_ref` | string | **yes** | - | Reference from `desktop_targets_list` |
+| `window_ref` | string | no | - | Choose one reference when several windows are open |
+| `delivery_mode` | string | no | `foreground` | `foreground` / `auto` / `background` |
+| `confirm` | boolean | no | - | Required to be `true` in strict confirm mode |
+
+**Returns** `target_token` for later `desktop_semantic_observe` calls, or a
+candidate list when the application has several windows.
+
+**Example**
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_target_bind","arguments":{"app_ref":"app:1a2b3c","confirm":true}}}
+```
+
+---
+
+### desktop_semantic_observe
+
+Read the bound target's UI Automation / Accessibility tree and return a complete
+JSON candidate page. Without `target_token` it observes the foreground window.
+Native handles, coordinates and platform locators stay inside the adapter; the
+caller sees only opaque candidate ids. Page with the same `observation_token`
+plus `next_cursor` (no re-capture). Use `desktop_semantic_candidate` for details
+and a replayable `workflow_step`.
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `goal` | string | no | - | Current desktop task; only builds and labels bounded candidates |
+| `target_token` | string | no | - | Task target token from `desktop_target_bind` |
+| `scope` | string | no | `window` | `window` / `menu` |
+| `subtree_id` | string | no | - | Element/region id from a local observation |
+| `observation_token` | string | no | - | Pass when paging; target and scope stay unchanged |
+| `cursor` | integer | no | `0` | Candidate/region page offset |
+| `view` | string | no | `candidates` | `candidates` / `regions` |
+| `tree_cursor` | string | no | - | Continuation token from `next_tree_cursor` (next native tree batch) |
+| `delivery_mode` | string | no | `foreground` | `foreground` / `auto` / `background` |
+
+**Returns** a bounded candidate page: `observation_token`, `candidates[]`,
+`control_candidates[]`, `regions[]`, `next_cursor`, `next_tree_cursor`,
+`tree_incomplete` and the observation identity.
+
+**Example**
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_semantic_observe","arguments":{"goal":"open preferences"}}}
+```
+
+---
+
+### desktop_semantic_candidate
+
+Read-only lookup of one candidate's details and its replayable `workflow_step`
+from the current observation. **Save the returned stable step — never save
+candidate ids or tokens.**
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `observation_token` | string | **yes** | - | Token from the current observation |
+| `candidate_id` | string | **yes** | - | Candidate id from the current observation |
+
+**Example**
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_semantic_candidate","arguments":{"observation_token":"obs:1f2e...","candidate_id":"candidate-3"}}}
+```
+
+---
+
+### desktop_semantic_execute
+
+Execute one `candidate_id` from the most recent `desktop_semantic_observe`. The
+matching `observation_token` must be returned. `SetValue` candidates may carry
+`value`, which is handed only to the local executor and is never sent to any
+model. The UI is re-read before dispatch and stale actions are rejected. **Never
+pass coordinates, selectors or scripts.** **Write tool** — requires
+`"confirm": true` in strict confirm mode.
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `observation_token` | string | **yes** | - | Unpredictable short-lived token from the latest observation |
+| `candidate_id` | string | **yes** | - | Candidate action id from the latest observation |
+| `value` | string | no | - | Local text for a `SetValue` candidate only (whitespace preserved) |
+| `delivery_mode` | string | no | latest observation | `foreground` / `auto` / `background` |
+| `checked` | boolean | no | - | Target state for `set_checked` |
+| `direction` | string | no | - | `up` / `down` / `left` / `right` |
+| `amount` | string | no | - | `small` / `page` |
+| `confirm` | boolean | no | - | Required to be `true` in strict confirm mode |
+
+**Returns** `status`, `verification`, `dispatch_state`, `effect`, the native
+`receipt` and a replayable `workflow_step`.
+
+**Example**
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_semantic_execute","arguments":{"observation_token":"obs:1f2e...","candidate_id":"candidate-3","confirm":true}}}
+```
+
+---
+
+### desktop_semantic_action
+
+Execute a stable semantic action saved from a workflow. The target window is
+rebound and the `locator` re-resolved at run time; no temporary
+`observation_token`, `candidate_id`, coordinates, selectors or scripts are
+involved. Text and range values are passed locally through `value`. **Write
+tool** — requires `"confirm": true` in strict confirm mode.
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `locator` | object | **yes** | - | Stable locator saved verbatim from `workflow_step` (`app_id` required) |
+| `action` | string | **yes** | - | `invoke` / `toggle` / `set_checked` / `select` / `expand` / `collapse` / `focus` / `set_value` / `scroll` / `scroll_into_view` / `set_range_value` |
+| `value` | string | no | - | For `set_value` / `set_range_value`; local UIA only |
+| `launch_ref` | string | no | - | Stable launch reference returned locally; never invent one |
+| `delivery_mode` | string | no | `foreground` | `foreground` / `auto` / `background` |
+| `checked` | boolean | no | - | Target state for `set_checked`; no click when already satisfied |
+| `direction` | string | no | - | `up` / `down` / `left` / `right` |
+| `amount` | string | no | - | `small` / `page` |
+| `completion_policy` | string | no | `auto` | `auto` / `verified` / `dispatched` |
+| `expectation` | object | no | - | Postcondition `{locator, condition, expected, value, timeout_ms, stable_samples}`; always verified, never replayed |
+| `confirm` | boolean | no | - | Required to be `true` in strict confirm mode |
+
+**Returns** `status`, `verification`, `dispatch_state`, `effect`, `receipt` and
+`business_goal_confirmed`.
+
+**Example**
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_semantic_action","arguments":{"locator":{"app_id":"app:1a2b3c","role":"button","automation_id":"save"},"action":"invoke","confirm":true}}}
+```
+
+---
+
+### desktop_verify_state
+
+Read-only verification of a window/element postcondition, optionally waiting for
+a bounded time. Returns `satisfied` / `unsatisfied` / `unknown`. It never
+re-sends the original action, launches an application or steals focus.
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `expectation` | object | **yes** | - | `{locator, condition, expected, value, timeout_ms, stable_samples}` |
+| `expectation.locator` | object | **yes** | - | Stable locator (`app_id` required) |
+| `expectation.condition` | string | **yes** | - | `exists` / `absent` / `window_exists` / `window_absent` / `focused` / `checked` / `selected` / `expanded` / `value_equals` |
+| `expectation.expected` | boolean | no | `true` | Expected state for boolean conditions |
+| `expectation.value` | string | no | - | Expected text for `value_equals` |
+| `expectation.timeout_ms` | integer | no | `5000` | Bounded wait, maximum `300000` |
+| `expectation.stable_samples` | integer | no | `2` | Consecutive stable reads, `1`–`5` |
+
+**Returns** `status` (`satisfied` / `unsatisfied` / `unknown`), `condition`,
+`reason` and the observed revision.
+
+**Example**
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"desktop_verify_state","arguments":{"expectation":{"locator":{"app_id":"app:1a2b3c","role":"check_box","accessible_name":"Enable sync"},"condition":"checked","expected":true}}}}
+```
 
 ---
 

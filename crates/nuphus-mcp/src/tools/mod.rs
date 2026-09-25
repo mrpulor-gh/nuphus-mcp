@@ -3,6 +3,7 @@
 pub mod browser;
 pub mod desktop;
 mod schemas;
+pub mod semantic;
 
 pub use schemas::{all_tools, ToolDef};
 

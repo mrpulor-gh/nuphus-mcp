@@ -333,14 +333,14 @@ mod imp {
                 unsafe { hud_paint(hwnd) }
                 LRESULT(0)
             }
-            WM_TIMER if wparam.0 as usize == HIDE_TIMER_ID => {
+            WM_TIMER if wparam.0 == HIDE_TIMER_ID => {
                 unsafe {
                     let _ = KillTimer(hwnd, ANIM_TIMER_ID);
                     let _ = ShowWindow(hwnd, SW_HIDE);
                 }
                 LRESULT(0)
             }
-            WM_TIMER if wparam.0 as usize == ANIM_TIMER_ID => {
+            WM_TIMER if wparam.0 == ANIM_TIMER_ID => {
                 unsafe {
                     let tick = ANIM_TICK.fetch_add(1, Ordering::AcqRel) + 1;
                     if tick <= FADE_IN_STEPS {
@@ -607,7 +607,7 @@ mod imp {
                 draw_progress_sweep(hdc, rc, accent);
             }
 
-            let _ = EndPaint(hwnd, &mut ps);
+            let _ = EndPaint(hwnd, &ps);
         }
     }
 

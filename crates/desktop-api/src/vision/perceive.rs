@@ -239,7 +239,7 @@ fn infer_kind(text: &str, rect: &Rect) -> ElementKind {
 
     // Rule 3: 1-4 chars without punctuation → Button
     let char_count = trimmed.chars().count();
-    if char_count >= 1 && char_count <= 4 && !contains_punctuation(trimmed) {
+    if (1..=4).contains(&char_count) && !contains_punctuation(trimmed) {
         return ElementKind::Button;
     }
 
