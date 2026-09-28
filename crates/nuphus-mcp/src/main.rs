@@ -12,8 +12,42 @@ use nuphus_browser::shutdown_browser;
 use nuphus_mcp::security::SecurityPolicy;
 use nuphus_mcp::server::McpServer;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Stack size for the thread that runs the stdio loop and every tool dispatch.
+///
+/// The deepest tool path (`browser_navigate` → CDP client → per-command
+/// timeouts → nested chromiumoxide futures) needs far more stack than the
+/// Windows default main-thread stack. On that path the process used to die with
+/// `thread 'main' has overflowed its stack` mid-tool, after which *every*
+/// `tools/call` went unanswered — indistinguishable from a total tool hang, and
+/// only recoverable by killing the process. Running the loop on a dedicated
+/// thread with room to spare removes that failure mode.
+const SERVE_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let handle = std::thread::Builder::new()
+        .name("nuphus-mcp-serve".to_string())
+        .stack_size(SERVE_STACK_BYTES)
+        .spawn(run_serve)?;
+    match handle.join() {
+        Ok(Ok(())) => Ok(()),
+        // Stringified on the serve thread so the error crosses the join safely.
+        Ok(Err(message)) => Err(message.into()),
+        // A panic in the serve thread belongs to the process, not to this
+        // wrapper: resume unwinding so the default handler reports it.
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Build the process runtime and run the stdio loop (on the big-stack thread).
+fn run_serve() -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to build the tokio runtime: {e}"))?;
+    runtime.block_on(serve()).map_err(|e| e.to_string())
+}
+
+async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

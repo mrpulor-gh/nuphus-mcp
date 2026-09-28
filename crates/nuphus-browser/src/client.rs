@@ -9,7 +9,7 @@ use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::js_protocol::runtime::RemoteObjectId;
 use chromiumoxide::handler::viewport::Viewport;
 use chromiumoxide::page::ScreenshotParams;
-use chromiumoxide::{Command, Method, Page};
+use chromiumoxide::{Command, Handler, Method, Page};
 use futures_util::StreamExt;
 use serde::Serialize;
 use std::borrow::Cow;
@@ -506,6 +506,20 @@ const NAVIGATE_DOM_READY_SECS: u64 = 12;
 /// stalls the whole tool for 30s. Wrapping every raw CDP call in [`cdp`] caps
 /// each at this budget and fails fast with a clear error instead.
 const CDP_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Effect-verification window (ms) for `browser_press`: a key that changes
+/// nothing within this window is reported instead of silently passing as
+/// "pressed". Kept short on purpose — many keys are legitimately inert
+/// (arrows on a static page), so a missing reaction is a note, not an error.
+const PRESS_EFFECT_WINDOW_MS: u64 = 2000;
+/// Budget for one page creation round trip. A wedged CDP connection (renderer
+/// replaced mid-navigation, dead browser) must fail fast with a readable error
+/// instead of holding the tool budget until the outer guard fires.
+const NEW_PAGE_TIMEOUT_SECS: u64 = 15;
+/// Budget for the liveness probe inside `instance_is_headless`, which runs on
+/// every launch/attach.
+const LAUNCH_PROBE_TIMEOUT_SECS: u64 = 3;
+/// Budget for teardown round trips in `close()`.
+const CLOSE_TIMEOUT_SECS: u64 = 5;
 
 /// Recursively walk the AX tree node array, collecting interactive nodes.
 ///
@@ -766,15 +780,45 @@ fn find_identity_processes(exe_path: &str) -> Vec<(Option<u16>, Option<PathBuf>)
         .collect()
 }
 
+/// Drive a CDP handler stream to completion, logging how it ended.
+///
+/// The handler task *owns* the browser connection: once it exits, every command
+/// issued afterwards fails fast with a transport error (the sender is dropped),
+/// which the tool layer converts into a reconnect. Without this log the death
+/// is invisible — the only visible symptom is a run of tool calls that "hang",
+/// with no cause recorded anywhere. That is exactly the shape of the
+/// "every browser_* tool times out" reports, so the exit must be loud.
+fn spawn_cdp_handler(mut handler: Handler) {
+    tokio::spawn(async move {
+        while let Some(event) = handler.next().await {
+            match event {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::error!(
+                        "[browser] CDP handler stream ended with an error: {e}. The browser \
+                         connection is dead — later commands fail fast and the tool layer \
+                         reconnects; a browser left resident for this profile survives."
+                    );
+                    return;
+                }
+            }
+        }
+        tracing::warn!(
+            "[browser] CDP handler stream closed cleanly (browser closed). The connection is \
+             dead — later commands fail fast and the tool layer reconnects."
+        );
+    });
+}
+
 /// Kill the Chrome main process(es) using the given profile dir.
 ///
 /// Used to upgrade a resident headless instance to a headed relaunch: an
 /// attached instance is not owned by this process (`child_process` is `None`),
 /// so `close()` only drops the CDP connection — the process itself must be
-/// terminated explicitly. Only the main process is targeted; child processes
+/// killed explicitly. Only the main process is targeted; child processes
 /// (renderer/gpu/utility, which carry `--type=`) die with the parent. A short
 /// wait lets the process release its profile locks before a hard relaunch.
-fn kill_chrome_for_profile(profile_dir: &std::path::Path) -> Result<(), BrowserError> {
+async fn kill_chrome_for_profile(profile_dir: &std::path::Path) -> Result<(), BrowserError> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
 
     let profile_key = profile_dir.to_string_lossy().to_lowercase();
@@ -818,7 +862,9 @@ fn kill_chrome_for_profile(profile_dir: &std::path::Path) -> Result<(), BrowserE
     }
 
     // Give the killed process a moment to release SingletonLock / SingletonSocket.
-    std::thread::sleep(std::time::Duration::from_millis(800));
+    // Async sleep: a blocking sleep would pin a runtime worker for the whole
+    // window, delaying every other task (CDP handler included) on that worker.
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     Ok(())
 }
 
@@ -1038,7 +1084,7 @@ impl BrowserClient {
                     self.profile_dir.display()
                 );
                 self.close().await?;
-                kill_chrome_for_profile(&self.profile_dir)?;
+                kill_chrome_for_profile(&self.profile_dir).await?;
                 // close() cleared the local connection; DevToolsActivePort may still point at
                 // the (now dead) instance — attach_target_alive() below detects the dead port
                 // and proceeds to a hard headed launch.
@@ -1238,12 +1284,12 @@ impl BrowserClient {
 
         // Connect to Chrome via the resolved WebSocket URL (stderr line or
         // DevToolsActivePort fallback)
-        let (browser, mut handler) = Browser::connect(&ws_url)
+        let (browser, handler) = Browser::connect(&ws_url)
             .await
             .map_err(|e| BrowserError::Launch(format!("CDP connect failed: {e}")))?;
 
         // Start handler running in background
-        tokio::spawn(async move { while handler.next().await.is_some() {} });
+        spawn_cdp_handler(handler);
 
         self.child_process = Some(child);
         self.browser = Some(Arc::new(Mutex::new(browser)));
@@ -1263,11 +1309,21 @@ impl BrowserClient {
             return Ok(false);
         };
         let browser = browser_arc.lock().await;
-        let version = browser
-            .version()
-            .await
-            .map_err(|e| BrowserError::Launch(format!("headless probe failed: {e}")))?;
-        Ok(version.user_agent.contains("HeadlessChrome"))
+        // Bounded: this probe runs on every launch/attach, and a wedged
+        // connection (dead renderer, browser shutting down) must surface as a
+        // fast, readable failure instead of hanging the whole tool call.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(LAUNCH_PROBE_TIMEOUT_SECS),
+            browser.version(),
+        )
+        .await
+        {
+            Ok(Ok(version)) => Ok(version.user_agent.contains("HeadlessChrome")),
+            Ok(Err(e)) => Err(BrowserError::Launch(format!("headless probe failed: {e}"))),
+            Err(_) => Err(BrowserError::Launch(
+                "headless probe timed out (CDP unresponsive)".into(),
+            )),
+        }
     }
 
     /// Try to attach to a Chrome instance already running for the same profile.
@@ -1293,14 +1349,14 @@ impl BrowserClient {
             .ok_or_else(|| BrowserError::Launch("DevToolsActivePort: missing ws path".into()))?;
         let ws_url = format!("ws://127.0.0.1:{port}{ws_path}");
 
-        let (browser, mut handler) =
+        let (browser, handler) =
             tokio::time::timeout(std::time::Duration::from_secs(3), Browser::connect(&ws_url))
                 .await
                 .map_err(|_| BrowserError::Launch("attach timed out".into()))?
                 .map_err(|e| BrowserError::Launch(format!("attach connect failed: {e}")))?;
 
         // Start handler running in background (same lifetime as the launch path)
-        tokio::spawn(async move { while handler.next().await.is_some() {} });
+        spawn_cdp_handler(handler);
 
         tracing::info!(
             "[Browser] attached to running Chrome instance (port={})",
@@ -1455,7 +1511,7 @@ impl BrowserClient {
             })?
             .to_string();
 
-        let (browser, mut handler) =
+        let (browser, handler) =
             tokio::time::timeout(std::time::Duration::from_secs(5), Browser::connect(&ws_url))
                 .await
                 .map_err(|_| {
@@ -1466,7 +1522,7 @@ impl BrowserClient {
                 })?;
 
         // Start handler running in background (same lifetime as the launch path)
-        tokio::spawn(async move { while handler.next().await.is_some() {} });
+        spawn_cdp_handler(handler);
 
         tracing::info!("[Browser] attached to external browser ({})", base);
         let browser_arc = Arc::new(Mutex::new(browser));
@@ -2245,11 +2301,41 @@ impl BrowserClient {
             .map_err(|e| BrowserError::Execution(format!("keyUp build: {e}")))?;
 
         let page = self.get_page().await?;
+        // Arm the change detector BEFORE dispatching. Without this a key the page
+        // silently drops passes as a successful "Pressed …" — most commonly when
+        // the tab is not the focused/visible one, so CDP input never reaches the
+        // document at all (verified: `document.hasFocus() === false` swallows
+        // `Input.dispatchKeyEvent`). click/type already do this; press must too.
+        // Armed before the page lock is taken: arming itself locks the page.
+        // Best-effort: a detector problem must never block the key dispatch —
+        // it only downgrades the verification below.
+        if let Err(e) = self.arm_change_detector().await {
+            tracing::debug!("[Browser] change detector could not be armed before press: {e}");
+        }
+
         let page_guard = page.lock().await;
         cdp_ctx("keyboard keyDown failed", page_guard.execute(key_down)).await?;
         cdp_ctx("keyboard keyUp failed", page_guard.execute(key_up)).await?;
+        drop(page_guard);
 
-        Ok(format!("Pressed {chord}"))
+        // Effect verification. A missing reaction is a note, not a failure: many
+        // keys are legitimately inert (arrows on a static page). The point is
+        // that the caller learns the difference instead of proceeding on a
+        // false "the key was pressed" premise.
+        let reacted = self
+            .wait_for_change(PRESS_EFFECT_WINDOW_MS)
+            .await
+            .unwrap_or(false);
+        if reacted {
+            return Ok(format!("Pressed {chord}"));
+        }
+        Ok(format!(
+            "Pressed {chord}\n\n⚠ No page reaction within {PRESS_EFFECT_WINDOW_MS}ms: the key \
+             was dispatched but nothing changed. Either the key is inert on this page, or the \
+             tab is not the focused/visible one (CDP input is dropped while \
+             `document.hasFocus()` is false). Confirm with browser_snapshot, and use \
+             browser_switch_tab / browser_new_tab to bring the target tab to the front."
+        ))
     }
 
     /// Arm the in-page DOM-change detector. Call *before* a write action, then
@@ -3299,7 +3385,14 @@ impl BrowserClient {
         if let Some(browser_arc) = self.browser.take() {
             if self.child_process.is_some() {
                 let mut browser = browser_arc.lock().await;
-                let _ = browser.close().await;
+                // `Browser.close` is a CDP round trip: bound it so a wedged
+                // connection cannot hold this call (and the shared client)
+                // past the tool budget.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(CLOSE_TIMEOUT_SECS),
+                    browser.close(),
+                )
+                .await;
                 drop(browser);
             }
             drop(browser_arc);
@@ -3313,10 +3406,20 @@ impl BrowserClient {
         self.download_configured = false;
         self.download_config_warning = None;
 
-        // Kill the child process (managed manually, not via Browser::launch)
+        // Kill the child process (managed manually, not via Browser::launch).
+        // Bounded: a Chrome that ignores terminate must not block shutdown or a
+        // reconnect forever (the handle is dropped either way).
         if let Some(mut child) = self.child_process.take() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(CLOSE_TIMEOUT_SECS),
+                child.kill(),
+            )
+            .await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(CLOSE_TIMEOUT_SECS),
+                child.wait(),
+            )
+            .await;
         }
 
         Ok(())
@@ -3418,10 +3521,19 @@ impl BrowserClient {
         let browser = self.browser.as_ref().ok_or(BrowserError::NotStarted)?;
 
         let browser_guard = browser.lock().await;
-        let page = browser_guard
-            .new_page(url.unwrap_or("about:blank"))
-            .await
-            .map_err(|e| BrowserError::Launch(e.to_string()))?;
+        // Bounded: a wedged connection (renderer replaced mid-navigation, browser
+        // going away) must fail fast with a readable error.
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(NEW_PAGE_TIMEOUT_SECS),
+            browser_guard.new_page(url.unwrap_or("about:blank")),
+        )
+        .await
+        .map_err(|_| {
+            BrowserError::Launch(format!(
+                "Timed out after {NEW_PAGE_TIMEOUT_SECS}s opening a new tab (CDP unresponsive)"
+            ))
+        })?
+        .map_err(|e| BrowserError::Launch(e.to_string()))?;
 
         let page_arc = Arc::new(Mutex::new(page));
         self.page = Some(page_arc);
@@ -3658,10 +3770,18 @@ impl BrowserClient {
         let browser = self.browser.as_ref().ok_or(BrowserError::NotStarted)?;
 
         let browser_guard = browser.lock().await;
-        let page = browser_guard
-            .new_page("about:blank")
-            .await
-            .map_err(|e| BrowserError::Launch(e.to_string()))?;
+        // Bounded: same rationale as `new_tab` — fail fast, readable error.
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(NEW_PAGE_TIMEOUT_SECS),
+            browser_guard.new_page("about:blank"),
+        )
+        .await
+        .map_err(|_| {
+            BrowserError::Launch(format!(
+                "Timed out after {NEW_PAGE_TIMEOUT_SECS}s creating a browser page (CDP unresponsive)"
+            ))
+        })?
+        .map_err(|e| BrowserError::Launch(e.to_string()))?;
 
         let page_arc = Arc::new(Mutex::new(page));
         self.page = Some(page_arc.clone());
@@ -4282,11 +4402,11 @@ mod tests {
     }
 
     /// Connection-level self-healing: after the Chrome child process is killed (an externally
-    /// killed / crashed browser), a direct operation hangs instead of failing fast (Windows
-    /// half-open websocket), the liveness probe reports the dead connection, and `reconnect()`
-    /// resets + relaunches + restores a usable page so the retried operation succeeds — the
-    /// caller observes recovery instead of a dead-connection error. This is the exact failure
-    /// mode of "receiver is gone" that users hit mid-workflow.
+    /// killed / crashed browser), a direct operation must stay bounded, the liveness probe
+    /// reports the dead connection, and `reconnect()` resets + relaunches + restores a usable
+    /// page so the retried operation succeeds — the caller observes recovery instead of a
+    /// dead-connection error. This is the exact failure mode of "receiver is gone" that users
+    /// hit mid-workflow.
     #[tokio::test]
     #[ignore = "launches real Chrome; requires Chrome installed locally"]
     async fn reconnect_recovers_dead_connection() {
@@ -4308,18 +4428,27 @@ mod tests {
         child.kill().await.expect("kill chrome");
         child.wait().await.expect("chrome exited");
 
-        // On Windows a killed Chrome does NOT surface as a fast error: the handler may block
-        // on the half-open websocket, so a direct operation hangs (verified below) instead of
-        // failing with "receiver is gone". This is exactly why the self-healing path must
-        // combine timeout + liveness probe + reconnect.
-        let hung = tokio::time::timeout(
+        // A killed browser is not a fast error by itself: the websocket is half-open, so the
+        // in-flight command can only be answered by something noticing the death. The handler
+        // task does exactly that — it ends when the stream dies, which drops the connection and
+        // fails everything pending on it. What the caller must never see is an unbounded hang:
+        // either the command fails fast, or the per-call CDP budget (and the tool-level budget
+        // above it) bounds it. Both funnels lead to probe + reconnect below.
+        let direct = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             client.snapshot(false, None),
         )
         .await;
+        let direct = match direct {
+            Ok(result) => result,
+            Err(_elapsed) => panic!(
+                "a direct operation on a dead connection must resolve within the probe window \
+                 (bounded), never hang"
+            ),
+        };
         assert!(
-            hung.is_err(),
-            "direct snapshot on dead connection should hang past the probe window"
+            direct.is_err(),
+            "a direct operation on a dead connection must report the failure, got: {direct:?}"
         );
         // The liveness probe confirms the connection is gone...
         assert!(

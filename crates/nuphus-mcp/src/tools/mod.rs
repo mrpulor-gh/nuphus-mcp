@@ -7,6 +7,11 @@ pub mod semantic;
 
 pub use schemas::{all_tools, ToolDef};
 
+/// How long a tool waits for the process-level automation lock (the one that
+/// serializes automation inside this process) before failing with "busy".
+/// It is acquired *outside* every per-tool budget, so it needs its own bound.
+const PROCESS_LOCK_TIMEOUT_SECS: u64 = 30;
+
 /// Tool execution result
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
@@ -46,11 +51,26 @@ impl ToolOutput {
 pub async fn execute(name: &str, args: &serde_json::Value) -> Result<ToolOutput, String> {
     // Process-level mutual exclusion: serialize automation operations within this
     // process. Held across the await points of the actual tool call.
+    // Bounded: this lock sits *outside* every per-tool budget, so an unbounded
+    // wait here would wedge the whole server (one stuck tool = every later call
+    // unanswered). Give up with a readable busy error instead.
     static PROCESS_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    let process_guard = PROCESS_LOCK
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
+    let process_guard = match tokio::time::timeout(
+        std::time::Duration::from_secs(PROCESS_LOCK_TIMEOUT_SECS),
+        PROCESS_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Ok(ToolOutput::failure(format!(
+                "Automation is busy: another operation in this process has held the automation \
+                 lock for over {PROCESS_LOCK_TIMEOUT_SECS}s; retry later."
+            )));
+        }
+    };
 
     // Cross-process lock: full coverage for every desktop_*/browser_* tool.
     // Read-only operations (e.g. desktop_screen_size) also acquire it — they still
