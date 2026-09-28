@@ -4402,11 +4402,11 @@ mod tests {
     }
 
     /// Connection-level self-healing: after the Chrome child process is killed (an externally
-    /// killed / crashed browser), a direct operation hangs instead of failing fast (Windows
-    /// half-open websocket), the liveness probe reports the dead connection, and `reconnect()`
-    /// resets + relaunches + restores a usable page so the retried operation succeeds — the
-    /// caller observes recovery instead of a dead-connection error. This is the exact failure
-    /// mode of "receiver is gone" that users hit mid-workflow.
+    /// killed / crashed browser), a direct operation must stay bounded, the liveness probe
+    /// reports the dead connection, and `reconnect()` resets + relaunches + restores a usable
+    /// page so the retried operation succeeds — the caller observes recovery instead of a
+    /// dead-connection error. This is the exact failure mode of "receiver is gone" that users
+    /// hit mid-workflow.
     #[tokio::test]
     #[ignore = "launches real Chrome; requires Chrome installed locally"]
     async fn reconnect_recovers_dead_connection() {
@@ -4428,18 +4428,27 @@ mod tests {
         child.kill().await.expect("kill chrome");
         child.wait().await.expect("chrome exited");
 
-        // On Windows a killed Chrome does NOT surface as a fast error: the handler may block
-        // on the half-open websocket, so a direct operation hangs (verified below) instead of
-        // failing with "receiver is gone". This is exactly why the self-healing path must
-        // combine timeout + liveness probe + reconnect.
-        let hung = tokio::time::timeout(
+        // A killed browser is not a fast error by itself: the websocket is half-open, so the
+        // in-flight command can only be answered by something noticing the death. The handler
+        // task does exactly that — it ends when the stream dies, which drops the connection and
+        // fails everything pending on it. What the caller must never see is an unbounded hang:
+        // either the command fails fast, or the per-call CDP budget (and the tool-level budget
+        // above it) bounds it. Both funnels lead to probe + reconnect below.
+        let direct = tokio::time::timeout(
             std::time::Duration::from_secs(3),
             client.snapshot(false, None),
         )
         .await;
+        let direct = match direct {
+            Ok(result) => result,
+            Err(_elapsed) => panic!(
+                "a direct operation on a dead connection must resolve within the probe window \
+                 (bounded), never hang"
+            ),
+        };
         assert!(
-            hung.is_err(),
-            "direct snapshot on dead connection should hang past the probe window"
+            direct.is_err(),
+            "a direct operation on a dead connection must report the failure, got: {direct:?}"
         );
         // The liveness probe confirms the connection is gone...
         assert!(
