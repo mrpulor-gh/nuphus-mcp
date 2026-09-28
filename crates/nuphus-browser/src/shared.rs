@@ -27,6 +27,11 @@ pub fn shared_client() -> Arc<Mutex<Option<BrowserClient>>> {
     INSTANCE.get_or_init(|| Arc::new(Mutex::new(None))).clone()
 }
 
+/// How long a browser tool waits for the process-wide client lock before giving
+/// up with a readable "busy" error. Every browser tool takes this lock, so an
+/// unbounded wait here is indistinguishable from the whole tool family hanging.
+const SHARED_CLIENT_LOCK_TIMEOUT_SECS: u64 = 30;
+
 /// get-or-launch: hold the lock to ensure a client exists and launch it per the requested mode, returning an owned guard.
 ///
 /// While the caller holds the guard, the browser is exclusively owned, guaranteeing that
@@ -35,7 +40,24 @@ pub fn shared_client() -> Arc<Mutex<Option<BrowserClient>>> {
 pub async fn get_or_launch(
     headless: bool,
 ) -> Result<OwnedMutexGuard<Option<BrowserClient>>, String> {
-    let mut guard = shared_client().lock_owned().await;
+    // Bounded acquisition: this mutex is process-wide and every browser tool
+    // takes it, so a wedged previous operation must not turn every later call
+    // into an unbounded wait (that failure mode reads as "the whole tool family
+    // hangs, only killing the process helps", with no error anywhere).
+    let mut guard = match tokio::time::timeout(
+        std::time::Duration::from_secs(SHARED_CLIENT_LOCK_TIMEOUT_SECS),
+        shared_client().lock_owned(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Err(format!(
+                "Browser automation is busy: another operation in this process has held the \
+                 shared browser client for over {SHARED_CLIENT_LOCK_TIMEOUT_SECS}s; retry later."
+            ));
+        }
+    };
     if guard.is_none() {
         let client =
             BrowserClient::new().map_err(|e| format!("Browser automation unavailable: {}", e))?;

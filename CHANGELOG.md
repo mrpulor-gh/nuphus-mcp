@@ -5,6 +5,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The server no longer dies mid-tool on its deepest path.** `browser_navigate`
+  runs the stdio loop + tool dispatch on the main thread with the default stack,
+  and that path (navigate → CDP client → per-command timeouts → nested
+  chromiumoxide futures) overflowed it: the process exited with
+  `thread 'main' has overflowed its stack`, after which every `tools/call` went
+  unanswered until the process was killed — with the spawned Chrome left holding
+  the debug port. The loop now runs on a dedicated thread with a 64 MB stack.
+- **A dead CDP connection is no longer silent.** The handler task used to swallow
+  its own exit, so a browser that went away left no trace and the only symptom was
+  a run of tool calls that "hang". It now logs how it ended (error vs. clean
+  close), which separates "the browser died" from "the page is busy".
+- **Unbounded waits are bounded** with readable errors — the shared browser
+  client lock and the process-level automation lock (both acquired outside every
+  per-tool budget, so either could wedge the whole server), the headless probe in
+  `instance_is_headless`, `Browser.close` / child `wait` in `close()`, and page
+  creation in `new_tab` / `get_or_create_page`.
+- **`browser_press` verifies its effect** like `browser_click` / `browser_type`
+  already did. A key that changes nothing within 2s now returns a note instead of
+  a silent "Pressed Enter". This also makes the focus trap visible: while a tab
+  is not the focused/visible one, CDP input is dropped (`document.hasFocus()` is
+  false) and nothing happens at all; the note points at `browser_switch_tab` /
+  `browser_new_tab`.
+
+### Changed
+
+- `kill_chrome_for_profile` waits with an async sleep instead of blocking a
+  runtime worker for 800ms.
+
 ## [0.3.0] - 2026-09-26
 
 ### Added
