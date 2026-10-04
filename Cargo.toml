@@ -12,3 +12,54 @@ license = "MIT"
 repository = "https://github.com/mrpulor-gh/nuphus-mcp"
 homepage = "https://github.com/mrpulor-gh/nuphus-mcp"
 documentation = "https://github.com/mrpulor-gh/nuphus-mcp"
+# ── dev 构建热点依赖优化（与主项目 Nuphus 同步，实测驱动）──
+# 同款 debug 失真：主项目 2026-10-04 实测，debug 下 PNG 编码 1884ms
+# （release 13ms）、xcap 抓屏 315ms（release 37ms）、OCR/YOLO 预处理
+# 循环再拖 perceive 数秒。MCP 侧 perception 链路（image PNG 编码 + xcap
+# 抓屏 + desktop-api 预处理）同构，收益同理。
+# 两个手段都要：仅 opt-level 不够——索引/减法密集的 deflate·CRC·滤波
+# 循环对 overflow-checks 数量级敏感（主项目实测 1884→290ms 是 opt-level，
+# →210ms 是关检查）；而 perceive 预处理热点在 desktop-api / nuphus-mcp
+# 自身 crate，包级覆盖够不着，需全局 opt-level=1（保行号调试、抓大头）。
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.image]
+opt-level = 2
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev.package.png]
+opt-level = 2
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev.package.fdeflate]
+opt-level = 2
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev.package.flate2]
+opt-level = 2
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev.package.miniz_oxide]
+opt-level = 2
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev.package.zlib-rs]
+opt-level = 2
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev.package.crc32fast]
+opt-level = 2
+debug-assertions = false
+overflow-checks = false
+
+[profile.dev.package.xcap]
+opt-level = 2
+debug-assertions = false
+overflow-checks = false
