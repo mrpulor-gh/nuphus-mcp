@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-11
+
 ### Fixed
 
 - **`browser_snapshot` no longer drops iframes: nested frames are collected, unreadable ones are disclosed.** The snapshot used to read only the main document's AX tree, so headings, inputs and buttons inside iframes never appeared — and the result still looked like a complete page. On pages whose main interaction lives in an iframe (payment callbacks, OAuth flows, relay dashboards) the agent silently got a crippled view (`browser_evaluate` reaching the same content through `window.frames` made the gap even harder to notice). Now: `Page.getFrameTree` enumerates every frame, and each session-reachable child frame is collected with its own `frameId`; main-document refs keep their original numbering and come first, nested-frame refs follow under a `── 嵌套 frame：… ──` header naming their frame, and `@N` resolution in click / type / exec routes by frame ownership (clicking an `@N` inside an iframe lands in the child document — verified by a live test). Frames that cannot be read (cross-process / cross-origin sandboxes, empty AX trees, over cap) are listed one by one in a trailing `⚠ … 未包含在上方快照中` disclosure, so a partial view is always explicit; if frame-tree enumeration itself fails, the snapshot degrades to the previous main-document-only behavior instead of failing.
