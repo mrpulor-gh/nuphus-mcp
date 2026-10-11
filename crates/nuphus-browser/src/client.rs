@@ -180,6 +180,126 @@ impl Command for GetFullAXTree {
     type Response = serde_json::Value;
 }
 
+/// CDP `Page.getFrameTree` — enumerate every frame of the page (main frame first,
+/// children recursively). Unlike the AX/DOM domains this is answered by the
+/// browser process, so it also sees cross-process (OOPIF) frames we cannot attach
+/// to — those become the explicit "未采集" disclosure instead of silence.
+#[derive(Debug, Clone, Serialize)]
+struct GetFrameTree;
+
+impl Method for GetFrameTree {
+    fn identifier(&self) -> Cow<'static, str> {
+        "Page.getFrameTree".into()
+    }
+}
+
+impl Command for GetFrameTree {
+    type Response = serde_json::Value;
+}
+
+/// Per-snapshot bounds for the frame walk. Real pages with more than ~20 iframes
+/// are ad farms; the cap keeps a pathological page from multiplying snapshot
+/// latency (one getFullAXTree round trip per frame).
+const MAX_SNAPSHOT_FRAMES: usize = 20;
+/// Defensive recursion cap for the getFrameTree walk (frames can nest frames).
+const MAX_FRAME_TREE_DEPTH: usize = 8;
+
+/// One row of the snapshot ref table: `@N` (1-based) maps to this entry.
+///
+/// `backendNodeId`s are only meaningful inside their own frame's DOM agent —
+/// for nodes collected from a nested frame the owning frame travels with the
+/// ref so failures can name it, and so a future cross-process attach can route
+/// the command by session instead of silently resolving the wrong node.
+#[derive(Debug, Clone)]
+struct SnapshotRef {
+    backend_node_id: u32,
+    /// frameId from `Page.getFrameTree`; `None` = main document. Not read yet —
+    /// cross-process (OOPIF) attach will route refs by it (frameId → sessionId),
+    /// and it keeps the ref table self-describing about frame ownership.
+    #[allow(dead_code)]
+    frame_id: Option<String>,
+    /// Human-readable frame identity for error messages (see `FrameInfo::label`).
+    frame_label: Option<String>,
+}
+
+/// A frame collected from `Page.getFrameTree`.
+#[derive(Debug, Clone)]
+struct FrameInfo {
+    id: String,
+    /// Frame URL as reported by the frame tree. `srcdoc` frames report
+    /// `about:srcdoc` (or empty) rather than a real origin.
+    url: String,
+}
+
+impl FrameInfo {
+    /// Best available human-readable identity: url, then a synthetic marker for
+    /// srcdoc frames (they carry no url of their own — Chrome reports
+    /// `about:srcdoc`).
+    fn label(&self) -> String {
+        let url = self.url.trim();
+        if url.is_empty() || url == "about:srcdoc" {
+            "srcdoc 内联框架".to_string()
+        } else {
+            url.to_string()
+        }
+    }
+}
+
+/// Recursively walk a `Page.getFrameTree` node (`frameTree` object), collecting
+/// every frame in document order: main frame first, then children depth-first.
+fn collect_frames(node: &serde_json::Value, out: &mut Vec<FrameInfo>, depth: usize) {
+    if depth > MAX_FRAME_TREE_DEPTH || out.len() >= MAX_SNAPSHOT_FRAMES {
+        return;
+    }
+    if let Some(id) = node
+        .get("frame")
+        .and_then(|f| f.get("id"))
+        .and_then(|v| v.as_str())
+    {
+        let url = node
+            .get("frame")
+            .and_then(|f| f.get("url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        out.push(FrameInfo {
+            id: id.to_string(),
+            url,
+        });
+    }
+    if let Some(children) = node.get("childFrames").and_then(|v| v.as_array()) {
+        for child in children {
+            collect_frames(child, out, depth + 1);
+        }
+    }
+}
+
+/// One frame that could not be captured, kept for the end-of-snapshot
+/// disclosure (see `snapshot_ax_tree`).
+struct SkippedFrame {
+    label: String,
+    reason: String,
+}
+
+/// Build the end-of-snapshot disclosure line: `None` when every frame was
+/// covered, otherwise one line naming each uncovered frame and why. Pure so
+/// the wording — which must make an agent re-plan its view of the page rather
+/// than skim past — stays unit-testable.
+fn format_frame_disclosure(skipped: &[SkippedFrame]) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "── ⚠ 以下 {} 个嵌套 frame 未包含在上方快照中：{}",
+        skipped.len(),
+        skipped
+            .iter()
+            .map(|s| format!("{}（{}）", s.label, s.reason))
+            .collect::<Vec<_>>()
+            .join("；")
+    ))
+}
+
 /// CDP `DOM.resolveNode` — resolve a `backendNodeId` to a `RemoteObjectId`.
 #[derive(Debug, Clone, Serialize)]
 struct DOMResolveNode {
@@ -410,9 +530,10 @@ pub struct BrowserClient {
     browser: Option<Arc<tokio::sync::Mutex<Browser>>>,
     /// Current page
     page: Option<Arc<tokio::sync::Mutex<Page>>>,
-    /// Cached backendNodeIds from last AX tree snapshot (index → backendNodeId).
-    /// @1 → index 0, @2 → index 1, etc.
-    snapshot_backend_ids: Vec<u32>,
+    /// Cached snapshot refs from the last AX tree snapshot (`@1` → index 0, …).
+    /// Each entry carries the owning frame so nested-frame refs stay resolvable
+    /// and failures can name the frame.
+    snapshot_refs: Vec<SnapshotRef>,
     /// Whether the __nuphus helpers have been injected into this page.
     helpers_injected: bool,
     /// Download directory path.
@@ -525,10 +646,18 @@ const CLOSE_TIMEOUT_SECS: u64 = 5;
 ///
 /// Each AXNode has an optional `children` array of nested AXNodes.
 /// We traverse the full tree and emit `@N [role] "name"` for interactive nodes.
+///
+/// `frame_id`/`frame_label` tag every produced ref with the frame the tree was
+/// fetched for (`None` = main document), so refs stay meaningful beyond the
+/// main frame. The `@N` display index is `refs.len() + 1` — numbering is global
+/// across frames (main frame first), which keeps main-frame-only pages on their
+/// previous numbering.
 fn collect_interactive_nodes(
     nodes: &[serde_json::Value],
-    backend_ids: &mut Vec<u32>,
+    refs: &mut Vec<SnapshotRef>,
     lines: &mut Vec<String>,
+    frame_id: Option<&str>,
+    frame_label: Option<&str>,
 ) {
     for node in nodes {
         // Check if node is ignored (non-interactive wrapper)
@@ -539,7 +668,7 @@ fn collect_interactive_nodes(
         {
             // Still traverse children of ignored nodes (they may contain interactive children)
             if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
-                collect_interactive_nodes(children, backend_ids, lines);
+                collect_interactive_nodes(children, refs, lines, frame_id, frame_label);
             }
             continue;
         }
@@ -569,8 +698,12 @@ fn collect_interactive_nodes(
         // Include if role is interactive and has a backendNodeId
         let interactive_role = !role.is_empty() && INTERACTIVE_ROLES.contains(&role);
         if let Some(backend_id) = backend_id.filter(|_| interactive_role) {
-            let idx = backend_ids.len() + 1; // 1-based display index
-            backend_ids.push(backend_id);
+            let idx = refs.len() + 1; // 1-based display index
+            refs.push(SnapshotRef {
+                backend_node_id: backend_id,
+                frame_id: frame_id.map(str::to_string),
+                frame_label: frame_label.map(str::to_string),
+            });
 
             let name_display = if name.len() > 60 {
                 let boundary = crate::floor_char_boundary(&name, 60);
@@ -589,7 +722,7 @@ fn collect_interactive_nodes(
 
         // Recurse into children
         if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
-            collect_interactive_nodes(children, backend_ids, lines);
+            collect_interactive_nodes(children, refs, lines, frame_id, frame_label);
         }
     }
 }
@@ -990,7 +1123,7 @@ impl BrowserClient {
             profile_dir,
             browser: None,
             page: None,
-            snapshot_backend_ids: Vec::new(),
+            snapshot_refs: Vec::new(),
             helpers_injected: false,
             download_dir,
             download_configured: false,
@@ -1012,7 +1145,7 @@ impl BrowserClient {
             profile_dir,
             browser: None,
             page: None,
-            snapshot_backend_ids: Vec::new(),
+            snapshot_refs: Vec::new(),
             helpers_injected: false,
             download_dir,
             download_configured: false,
@@ -1629,7 +1762,7 @@ impl BrowserClient {
         self.helpers_injected = false;
         // @N refs point at the pre-navigation page's backendNodeIds — clear them
         // so a stale ref can never click the wrong element on the new page.
-        self.snapshot_backend_ids.clear();
+        self.snapshot_refs.clear();
 
         let page = self.get_or_create_page().await?;
         let page_guard = page.lock().await;
@@ -1739,9 +1872,17 @@ impl BrowserClient {
 
     /// AX tree snapshot via CDP `Accessibility.getFullAXTree`.
     ///
-    /// Returns formatted text like `@1 [button] "Submit"` and caches backendNodeIds
+    /// Returns formatted text like `@1 [button] "Submit"` and caches the refs
     /// internally for click/type resolution.
     /// Optional `selector` scopes to a subtree — only elements within that DOM node are collected.
+    ///
+    /// After the main document, every child frame reported by `Page.getFrameTree`
+    /// is walked the same way (frameId-scoped `getFullAXTree`): main-frame refs
+    /// keep their numbering and come first, nested-frame refs follow under a
+    /// header that names the frame. Frames we cannot read (cross-process /
+    /// cross-origin sandboxes, frames that errored or hold no AX nodes) are
+    /// listed explicitly at the end — a snapshot must never silently imply a
+    /// whole page when it only covers part of it.
     async fn snapshot_ax_tree(&mut self, selector: Option<&str>) -> Result<String, BrowserError> {
         let page = self.get_page().await?;
         let page_guard = page.lock().await;
@@ -1786,12 +1927,13 @@ impl BrowserClient {
             })?;
 
         if nodes.is_empty() {
-            self.snapshot_backend_ids.clear();
+            self.snapshot_refs.clear();
             return Ok(String::new());
         }
 
+        // Shared ref table across frames (main frame first — see SnapshotRef).
+        self.snapshot_refs.clear();
         let mut lines: Vec<String> = Vec::new();
-        let mut backend_ids: Vec<u32> = Vec::new();
 
         if let Some(sid) = scope_id {
             // Scoped: find the scope node in the AX tree, then only collect its subtree.
@@ -1800,7 +1942,13 @@ impl BrowserClient {
             match extract_subtree_children(nodes, sid) {
                 Some(found_children) => {
                     tracing::info!("[Browser] AX snapshot scoped: found {} children for backendNodeId={} (AX tree has {} nodes)", found_children.len(), sid, ax_nodes_count);
-                    collect_interactive_nodes(&found_children, &mut backend_ids, &mut lines);
+                    collect_interactive_nodes(
+                        &found_children,
+                        &mut self.snapshot_refs,
+                        &mut lines,
+                        None,
+                        None,
+                    );
                 }
                 None => {
                     tracing::warn!("[Browser] AX snapshot scoped: backendNodeId={} not found in AX tree ({} nodes), falling back to JS snapshot", sid, ax_nodes_count);
@@ -1812,16 +1960,109 @@ impl BrowserClient {
             }
         } else {
             // Full tree (existing behavior)
-            collect_interactive_nodes(nodes, &mut backend_ids, &mut lines);
+            collect_interactive_nodes(nodes, &mut self.snapshot_refs, &mut lines, None, None);
         }
 
-        self.snapshot_backend_ids = backend_ids;
+        // Nested frames: walk the frame tree and collect each readable one.
+        let mut skipped: Vec<SkippedFrame> = Vec::new();
+        let frames = match self.collect_frame_infos(&page_guard).await {
+            Ok(frames) => frames,
+            Err(e) => {
+                // Frame enumeration failing must not break the main-frame snapshot;
+                // we simply cannot say whether frames exist.
+                tracing::warn!("[Browser] frame tree enumeration failed: {}", e);
+                vec![]
+            }
+        };
+        // collect_frame_infos returns document order: [0] is the main frame.
+        let child_frames = frames.into_iter().skip(1).collect::<Vec<_>>();
+        let traversed_frames = child_frames.len().min(MAX_SNAPSHOT_FRAMES);
+        for frame in child_frames.iter().take(traversed_frames) {
+            let label = frame.label();
+            match self.ax_nodes_for_frame(&page_guard, &frame.id).await {
+                Ok(child_nodes) if !child_nodes.is_empty() => {
+                    let mut child_lines: Vec<String> = Vec::new();
+                    collect_interactive_nodes(
+                        &child_nodes,
+                        &mut self.snapshot_refs,
+                        &mut child_lines,
+                        Some(&frame.id),
+                        Some(&label),
+                    );
+                    if child_lines.is_empty() {
+                        skipped.push(SkippedFrame {
+                            label,
+                            reason: "框架内无可交互元素".to_string(),
+                        });
+                        continue;
+                    }
+                    lines.push(format!("── 嵌套 frame：{} ──", label));
+                    lines.extend(child_lines);
+                }
+                Ok(_) => skipped.push(SkippedFrame {
+                    label,
+                    reason: "该框架的可访问性树为空".to_string(),
+                }),
+                Err(e) => skipped.push(SkippedFrame {
+                    label,
+                    reason: format!("无法读取该框架的可访问性树：{}", e),
+                }),
+            }
+        }
+        if child_frames.len() > traversed_frames {
+            skipped.push(SkippedFrame {
+                label: format!("等 {} 个框架", child_frames.len() - traversed_frames),
+                reason: format!("嵌套框架数量超过上限 {}，未逐一采集", MAX_SNAPSHOT_FRAMES),
+            });
+        }
+
+        // Disclosure footer: anything the snapshot did NOT cover must be stated,
+        // never silently dropped — an agent that cannot tell a partial page from
+        // a complete one will misplan every follow-up step.
+        if let Some(footer) = format_frame_disclosure(&skipped) {
+            lines.push(footer);
+        }
 
         if lines.is_empty() {
             return Ok(String::new());
         }
 
         Ok(lines.join("\n"))
+    }
+
+    /// Enumerate the page's frames via CDP `Page.getFrameTree`.
+    ///
+    /// Returns document order: the main frame first, then child frames
+    /// depth-first. Bounded by `MAX_SNAPSHOT_FRAMES` / `MAX_FRAME_TREE_DEPTH`.
+    async fn collect_frame_infos(&self, page: &Page) -> Result<Vec<FrameInfo>, BrowserError> {
+        let resp = cdp(page.execute(GetFrameTree)).await?;
+        let mut frames = Vec::new();
+        if let Some(tree) = resp.result.get("frameTree") {
+            collect_frames(tree, &mut frames, 0);
+        }
+        Ok(frames)
+    }
+
+    /// Fetch the AX nodes of a specific frame via `Accessibility.getFullAXTree`
+    /// with a `frameId`. Only frames the current CDP session can reach answer —
+    /// cross-process (OOPIF) frames reject with an error, which the caller turns
+    /// into a disclosure line.
+    async fn ax_nodes_for_frame(
+        &self,
+        page: &Page,
+        frame_id: &str,
+    ) -> Result<Vec<serde_json::Value>, BrowserError> {
+        let cmd = GetFullAXTree {
+            depth: None,
+            frame_id: Some(frame_id.to_string()),
+        };
+        let resp = cdp(page.execute(cmd)).await?;
+        Ok(resp
+            .result
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default())
     }
 
     /// JS DOM traversal snapshot (existing behavior, now fallback-only).
@@ -1915,23 +2156,18 @@ impl BrowserClient {
         let page = self.get_page().await?;
         let page_guard = page.lock().await;
 
-        // New AX tree ref: @N (1-based index into snapshot_backend_ids)
+        // New AX tree ref: @N (1-based index into snapshot_refs)
         if let Some(idx_str) = selector.strip_prefix('@') {
             if let Ok(idx) = idx_str.parse::<usize>() {
-                if idx < 1 || idx > self.snapshot_backend_ids.len() {
-                    return Err(BrowserError::ElementNotFound(
-                        selector.to_string(),
-                        format!(
-                            "@{} out of range (max @{})",
-                            idx,
-                            self.snapshot_backend_ids.len()
-                        ),
-                    ));
-                }
-                let backend_id = self.snapshot_backend_ids[idx - 1];
+                let (backend_id, frame_label) = self.ax_ref(idx)?;
                 return self
                     .retry_on_stale(|| {
-                        self.click_via_backend_node_id(&page_guard, backend_id, selector)
+                        self.click_via_backend_node_id(
+                            &page_guard,
+                            backend_id,
+                            selector,
+                            frame_label,
+                        )
                     })
                     .await;
             }
@@ -2062,18 +2298,10 @@ impl BrowserClient {
         let coords: String = if let Some(rest) = selector.strip_prefix('@') {
             if let Ok(idx) = rest.parse::<usize>() {
                 // @N AX ref path — resolve backendNodeId, then callFunctionOn for the rect
-                if idx < 1 || idx > self.snapshot_backend_ids.len() {
-                    return Err(BrowserError::ElementNotFound(
-                        selector.to_string(),
-                        format!(
-                            "@{} out of range (max @{})",
-                            idx,
-                            self.snapshot_backend_ids.len()
-                        ),
-                    ));
-                }
-                let backend_id = self.snapshot_backend_ids[idx - 1];
-                let object_id = self.resolve_backend_node(page, backend_id).await?;
+                let (backend_id, frame_label) = self.ax_ref(idx)?;
+                let object_id = self
+                    .resolve_backend_node(page, backend_id, frame_label)
+                    .await?;
                 let cmd = RuntimeCallFunctionOn {
                     function_declaration: format!(
                         "function(){{ const el = this; el.scrollIntoViewIfNeeded(); {} }}",
@@ -2093,7 +2321,8 @@ impl BrowserClient {
                         .unwrap_or("unknown exception");
                     return Err(BrowserError::Execution(format!(
                         "element_center JS exception on {}: {}",
-                        selector, desc
+                        Self::ref_with_frame(selector, frame_label),
+                        desc
                     )));
                 }
                 resp.result
@@ -2179,20 +2408,16 @@ impl BrowserClient {
         // New AX tree ref: @N
         if let Some(idx_str) = selector.strip_prefix('@') {
             if let Ok(idx) = idx_str.parse::<usize>() {
-                if idx < 1 || idx > self.snapshot_backend_ids.len() {
-                    return Err(BrowserError::ElementNotFound(
-                        selector.to_string(),
-                        format!(
-                            "@{} out of range (max @{})",
-                            idx,
-                            self.snapshot_backend_ids.len()
-                        ),
-                    ));
-                }
-                let backend_id = self.snapshot_backend_ids[idx - 1];
+                let (backend_id, frame_label) = self.ax_ref(idx)?;
                 return self
                     .retry_on_stale(|| {
-                        self.type_via_backend_node_id(&page_guard, backend_id, selector, text)
+                        self.type_via_backend_node_id(
+                            &page_guard,
+                            backend_id,
+                            selector,
+                            text,
+                            frame_label,
+                        )
                     })
                     .await;
             }
@@ -2483,16 +2708,48 @@ impl BrowserClient {
             || msg.contains("not attached")
     }
 
+    /// Look up a 1-based `@N` snapshot ref → (backendNodeId, owning frame label).
+    /// Shared by click / type / trusted-click so the bounds check lives in exactly
+    /// one place, and every consumer can name the frame a failing ref came from.
+    fn ax_ref(&self, idx: usize) -> Result<(u32, Option<&str>), BrowserError> {
+        if idx < 1 || idx > self.snapshot_refs.len() {
+            return Err(BrowserError::ElementNotFound(
+                format!("@{idx}"),
+                format!("@{} out of range (max @{})", idx, self.snapshot_refs.len()),
+            ));
+        }
+        let entry = &self.snapshot_refs[idx - 1];
+        Ok((entry.backend_node_id, entry.frame_label.as_deref()))
+    }
+
+    /// Render a ref selector with its owning frame for error messages:
+    /// `@7 (frame: https://pay.example.com/…)`, or plain `@7` for the main frame.
+    fn ref_with_frame(selector: &str, frame_label: Option<&str>) -> String {
+        match frame_label {
+            Some(label) => format!("{selector} (frame: {label})"),
+            None => selector.to_string(),
+        }
+    }
+
     /// Click an element by its backendNodeId via CDP DOM.resolveNode + Runtime.callFunctionOn.
     /// Uses a custom CDP command to avoid chromiumoxide's auto-injection of `executionContextId`,
     /// which conflicts with `objectId` in the CDP protocol.
+    ///
+    /// `frame_label` names the frame the node was collected from (None = main
+    /// document); it only decorates failures — the objectId returned by
+    /// DOM.resolveNode already carries the execution context, so callFunctionOn
+    /// reaches the right frame without extra routing.
     async fn click_via_backend_node_id(
         &self,
         page: &Page,
         backend_node_id: u32,
         selector: &str,
+        frame_label: Option<&str>,
     ) -> Result<String, BrowserError> {
-        let object_id = self.resolve_backend_node(page, backend_node_id).await?;
+        let displayed = Self::ref_with_frame(selector, frame_label);
+        let object_id = self
+            .resolve_backend_node(page, backend_node_id, frame_label)
+            .await?;
 
         let cmd = RuntimeCallFunctionOn {
             function_declaration: "function(){ this.scrollIntoViewIfNeeded(); this.click(); }"
@@ -2513,11 +2770,11 @@ impl BrowserClient {
                 .unwrap_or("unknown exception");
             return Err(BrowserError::Execution(format!(
                 "Click JS exception on {}: {}",
-                selector, desc
+                displayed, desc
             )));
         }
 
-        Ok(format!("Clicked {}", selector))
+        Ok(format!("Clicked {}", displayed))
     }
 
     /// Type text into an element by its backendNodeId via CDP DOM.resolveNode + Runtime.callFunctionOn.
@@ -2528,8 +2785,12 @@ impl BrowserClient {
         backend_node_id: u32,
         selector: &str,
         text: &str,
+        frame_label: Option<&str>,
     ) -> Result<String, BrowserError> {
-        let object_id = self.resolve_backend_node(page, backend_node_id).await?;
+        let displayed = Self::ref_with_frame(selector, frame_label);
+        let object_id = self
+            .resolve_backend_node(page, backend_node_id, frame_label)
+            .await?;
 
         // Step 1: Focus the target element (scroll into view + clear + focus)
         let focus_func =
@@ -2551,7 +2812,7 @@ impl BrowserClient {
                 .unwrap_or("unknown exception");
             return Err(BrowserError::Execution(format!(
                 "Type JS exception on {}: {}",
-                selector, desc
+                displayed, desc
             )));
         }
 
@@ -2563,21 +2824,31 @@ impl BrowserClient {
         };
         cdp_ctx("Input.insertText failed", page.execute(input_cmd)).await?;
 
-        Ok(format!("Typed '{}' into {}", text, selector))
+        Ok(format!("Typed '{}' into {}", text, displayed))
     }
 
     /// Resolve a backendNodeId to a RemoteObjectId via CDP DOM.resolveNode.
+    ///
+    /// `frame_label` only decorates the failure with the frame the node was
+    /// collected from — backendNodeIds are per-frame-agent ids, and naming the
+    /// frame is the difference between "node gone" and "this ref lives in a
+    /// frame this session can't reach".
     async fn resolve_backend_node(
         &self,
         page: &Page,
         backend_node_id: u32,
+        frame_label: Option<&str>,
     ) -> Result<RemoteObjectId, BrowserError> {
         let cmd = DOMResolveNode {
             backend_node_id,
             object_group: None,
         };
 
-        let resp = cdp_ctx("DOM.resolveNode failed", page.execute(cmd)).await?;
+        let ctx = match frame_label {
+            Some(label) => format!("DOM.resolveNode failed (node is in frame {label})"),
+            None => "DOM.resolveNode failed".to_string(),
+        };
+        let resp = cdp_ctx(&ctx, page.execute(cmd)).await?;
 
         let object_id_str = resp
             .result
@@ -3401,7 +3672,7 @@ impl BrowserClient {
         self.launched_headless = None;
         // Session state must not leak into the next launch: @N refs die with the
         // page, and download behavior has to be re-configured on the new browser.
-        self.snapshot_backend_ids.clear();
+        self.snapshot_refs.clear();
         self.helpers_injected = false;
         self.download_configured = false;
         self.download_config_warning = None;
@@ -3480,7 +3751,7 @@ impl BrowserClient {
         self.browser = None;
         self.page = None;
         self.launched_headless = None;
-        self.snapshot_backend_ids.clear();
+        self.snapshot_refs.clear();
         self.helpers_injected = false;
         self.download_configured = false;
         self.download_config_warning = None;
@@ -3538,7 +3809,7 @@ impl BrowserClient {
         let page_arc = Arc::new(Mutex::new(page));
         self.page = Some(page_arc);
         // New page, new backendNodeId space — stale @N refs must not carry over.
-        self.snapshot_backend_ids.clear();
+        self.snapshot_refs.clear();
 
         // Enable DOM domain for the new tab and register the anti-detection script.
         {
@@ -3603,7 +3874,7 @@ impl BrowserClient {
         let page_arc = Arc::new(Mutex::new(page.clone()));
         self.page = Some(page_arc);
         // Different tab, different backendNodeId space — stale @N refs must not carry over.
-        self.snapshot_backend_ids.clear();
+        self.snapshot_refs.clear();
 
         let url = cdp(page.url())
             .await
@@ -3758,7 +4029,7 @@ impl BrowserClient {
         }
 
         // Different page, different backendNodeId space — stale @N refs must not carry over.
-        self.snapshot_backend_ids.clear();
+        self.snapshot_refs.clear();
         tracing::info!("[Browser] adopted existing page as current tab");
     }
 
@@ -5127,5 +5398,282 @@ target.addEventListener('keydown', function(event) {
         assert_eq!(dev_tools_active_port_url(&missing).await, None);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&missing);
+    }
+
+    // ───────────────── iframe / nested frame coverage ─────────────────
+
+    /// Snapshot must cover reachable nested frames, not just the main document,
+    /// and must name the frames it could NOT cover instead of silently dropping
+    /// them. The srcdoc frame inherits the parent origin so it is the
+    /// deterministic "reachable" case; cross-scheme/cross-origin frames are the
+    /// "must at least be disclosed" case.
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn snapshot_covers_reachable_iframe_frames() {
+        let inner_url = fixture_url(
+            "frames_inner",
+            "<h2>INNER-FILE-MARKER</h2><button>INNER-FILE-BTN</button>",
+        );
+        let outer = format!(
+            r#"<!doctype html><html><body>
+            <h1>OUTER-MARKER-ALPHA</h1>
+            <button id="outer-btn">OUTER-BUTTON-BETA</button>
+            <iframe srcdoc="<h2>SRCDOC-MARKER-GAMMA</h2><button id='srcdoc-btn'>SRCDOC-BUTTON-EPSILON</button>" width="400" height="150"></iframe>
+            <iframe src="{inner_url}" width="400" height="150"></iframe>
+            </body></html>"#
+        );
+        let url = fixture_url("frames_outer", &outer);
+
+        let mut client = isolated_client("frames_snapshot");
+        client.launch(true).await.expect("launch headless");
+        client.navigate(&url).await.expect("navigate");
+
+        let snap = client.snapshot(false, None).await.expect("snapshot");
+
+        // Main document is still there, unchanged shape.
+        assert!(
+            snap.contains("OUTER-MARKER-ALPHA"),
+            "main-document content missing: {snap}"
+        );
+        assert!(
+            snap.contains("OUTER-BUTTON-BETA"),
+            "main-document button missing: {snap}"
+        );
+
+        // Reachable nested frame (srcdoc) is collected and introduced by a header.
+        assert!(
+            snap.contains("SRCDOC-MARKER-GAMMA"),
+            "nested-frame content missing from snapshot: {snap}"
+        );
+        assert!(
+            snap.contains("嵌套 frame"),
+            "nested-frame header missing: {snap}"
+        );
+
+        // The cross-origin file iframe must never vanish silently: either it was
+        // collected, or the disclosure footer names it. Both are valid Chrome
+        // outcomes; silence is the bug being fixed.
+        let disclosed = snap.contains("未包含在上方快照中");
+        let collected = snap.contains("INNER-FILE-MARKER");
+        assert!(
+            disclosed || collected,
+            "file iframe neither collected nor disclosed: {snap}"
+        );
+
+        // Every listed ref resolves to exactly one frame-owned entry; the @N
+        // numbering is global (main first), so click of a nested ref works.
+        let ref_count = snap.lines().filter(|l| l.starts_with('@')).count();
+        assert_eq!(
+            ref_count,
+            client.snapshot_refs.len(),
+            "ref table and textual @N numbering diverged: {snap}"
+        );
+        assert!(
+            client
+                .snapshot_refs
+                .iter()
+                .any(|r| r.frame_label.as_deref() == Some("srcdoc 内联框架")),
+            "srcdoc refs not tagged with their frame; labels={:?}",
+            client
+                .snapshot_refs
+                .iter()
+                .map(|r| r.frame_label.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let _ = client.close().await;
+        cleanup_profile("frames_snapshot");
+    }
+
+    /// Clicking an `@N` ref that lives inside a nested frame must reach the frame.
+    /// The srcdoc button writes to `parent.document.title` (same origin), which
+    /// proves the objectId resolved through the child frame's execution context.
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn click_ref_inside_iframe_reaches_frame() {
+        let outer = r#"<!doctype html><html><head><title>outer-title</title></head><body>
+        <h1>OUTER-MARKER-ALPHA</h1>
+        <iframe srcdoc="<button id='srcdoc-btn' onclick=&quot;parent.document.title='SRCDOC-CLICKED'&quot;>SRCDOC-BUTTON-EPSILON</button>" width="400" height="150"></iframe>
+        </body></html>"#;
+        let url = fixture_url("frames_click", outer);
+
+        let mut client = isolated_client("frames_click");
+        client.launch(true).await.expect("launch headless");
+        client.navigate(&url).await.expect("navigate");
+
+        let snap = client.snapshot(false, None).await.expect("snapshot");
+        assert!(
+            snap.contains("SRCDOC-BUTTON-EPSILON"),
+            "nested-frame button missing from snapshot: {snap}"
+        );
+        // Ref index of the nested button: the last @N line that names its role.
+        let nested_idx = client
+            .snapshot_refs
+            .iter()
+            .position(|r| r.frame_label.as_deref() == Some("srcdoc 内联框架"))
+            .expect("a ref tagged with the srcdoc frame");
+        let selector = format!("@{}", nested_idx + 1);
+
+        let result = client.click(&selector).await.expect("click nested ref");
+        assert!(
+            result.contains("Clicked"),
+            "unexpected click result: {result}"
+        );
+
+        let title = client.evaluate("document.title").await.expect("title read");
+        assert_eq!(
+            title.as_str().map(str::trim),
+            Some("SRCDOC-CLICKED"),
+            "nested-frame click did not land in the child frame (title unchanged)"
+        );
+
+        let _ = client.close().await;
+        cleanup_profile("frames_click");
+    }
+
+    /// `collect_frames` walks the frame tree in document order: main frame first,
+    /// then children depth-first.
+    #[test]
+    fn collect_frames_document_order() {
+        let tree = serde_json::json!({
+            "frame": { "id": "main", "url": "https://outer.example/a" },
+            "childFrames": [
+                {
+                    "frame": { "id": "c1", "url": "https://child.example/b" },
+                    "childFrames": [
+                        { "frame": { "id": "c1a", "url": "https://grand.example/c" } }
+                    ]
+                },
+                { "frame": { "id": "c2", "url": "" } }
+            ]
+        });
+        let mut frames = Vec::new();
+        collect_frames(&tree, &mut frames, 0);
+        assert_eq!(
+            frames.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["main", "c1", "c1a", "c2"]
+        );
+        // srcdoc frames report "about:srcdoc" (or nothing); the label normalizes
+        // both to a synthetic marker.
+        assert_eq!(frames[0].label(), "https://outer.example/a");
+        assert_eq!(frames[3].label(), "srcdoc 内联框架");
+        assert_eq!(
+            FrameInfo {
+                id: "x".into(),
+                url: "about:srcdoc".into()
+            }
+            .label(),
+            "srcdoc 内联框架"
+        );
+    }
+
+    /// A pathological page (ad farm) must not multiply the frame walk past the
+    /// cap — the disclosure then says how many frames were left out.
+    #[test]
+    fn collect_frames_respects_cap() {
+        // Wide, shallow tree: 30 sibling frames under the main frame (depth 1,
+        // so the depth cap never fires and the size cap is what must bite).
+        let children: Vec<serde_json::Value> = (0..30)
+            .map(|i| serde_json::json!({ "frame": { "id": format!("c{i}"), "url": "" } }))
+            .collect();
+        let tree = serde_json::json!({
+            "frame": { "id": "main", "url": "https://outer.example/" },
+            "childFrames": children
+        });
+        let mut frames = Vec::new();
+        collect_frames(&tree, &mut frames, 0);
+        assert_eq!(frames.len(), MAX_SNAPSHOT_FRAMES);
+        assert_eq!(frames[0].id, "main", "main frame stays first");
+        assert_eq!(
+            frames.last().map(|f| f.id.as_str()),
+            Some("c18"),
+            "siblings fill the table in document order"
+        );
+    }
+
+    /// `@N` numbering is global across frames (main frame first), and each ref
+    /// stays tagged with its owning frame.
+    #[test]
+    fn interactive_nodes_number_across_frames() {
+        let main_nodes = serde_json::json!([{
+            "role": { "value": "button" },
+            "name": { "value": "OUTER" },
+            "backendDOMNodeId": 11
+        }]);
+        let child_nodes = serde_json::json!([{
+            "role": { "value": "heading" },
+            "name": { "value": "INNER" },
+            "backendDOMNodeId": 22
+        }]);
+        let mut refs = Vec::new();
+        let mut lines = Vec::new();
+        collect_interactive_nodes(
+            main_nodes.as_array().unwrap(),
+            &mut refs,
+            &mut lines,
+            None,
+            None,
+        );
+        collect_interactive_nodes(
+            child_nodes.as_array().unwrap(),
+            &mut refs,
+            &mut lines,
+            Some("f1"),
+            Some("srcdoc 内联框架"),
+        );
+        assert_eq!(
+            lines,
+            vec!["@1 [button] \"OUTER\"", "@2 [heading] \"INNER\""]
+        );
+        assert_eq!(refs[0].backend_node_id, 11);
+        assert_eq!(refs[0].frame_label, None);
+        assert_eq!(refs[1].backend_node_id, 22);
+        assert_eq!(refs[1].frame_label.as_deref(), Some("srcdoc 内联框架"));
+    }
+
+    /// Disclosure wording: absent when everything is covered; one line naming
+    /// every uncovered frame otherwise.
+    #[test]
+    fn frame_disclosure_wording() {
+        assert_eq!(format_frame_disclosure(&[]), None);
+        let skipped = vec![
+            SkippedFrame {
+                label: "https://pay.example/cb".to_string(),
+                reason: "无法读取该框架的可访问性树：Frame not found".to_string(),
+            },
+            SkippedFrame {
+                label: "srcdoc 内联框架".to_string(),
+                reason: "该框架的可访问性树为空".to_string(),
+            },
+        ];
+        let line = format_frame_disclosure(&skipped).expect("footer");
+        assert!(line.contains("未包含在上方快照中"), "{line}");
+        assert!(line.contains("https://pay.example/cb"), "{line}");
+        assert!(
+            line.contains("srcdoc 内联框架（该框架的可访问性树为空）"),
+            "{line}"
+        );
+    }
+
+    /// `@N` lookup is centralized: out-of-range errors carry the max ref count,
+    /// and frame ownership surfaces in decorated selector names.
+    #[test]
+    fn ax_ref_bounds_and_frame_decoration() {
+        let client = isolated_client("ax_ref_unit");
+        let err = client.ax_ref(1).expect_err("empty table must fail");
+        assert!(
+            err.to_string().contains("out of range (max @0)"),
+            "bounds message missing: {err}"
+        );
+        assert_eq!(
+            BrowserClient::ref_with_frame("@7", None),
+            "@7",
+            "main-frame refs stay undecorated"
+        );
+        assert_eq!(
+            BrowserClient::ref_with_frame("@7", Some("https://pay.example/")),
+            "@7 (frame: https://pay.example/)",
+            "nested-frame refs name their frame"
+        );
     }
 }

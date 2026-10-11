@@ -396,7 +396,7 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "browser_snapshot",
-            "Text snapshot of visible interactive elements via AX tree: @N [role] \"name\". Use @N refs for click/type. Falls back to DOM traversal if AX unavailable.",
+            "Text snapshot of visible interactive elements via AX tree: @N [role] \"name\". Use @N refs for click/type. Falls back to DOM traversal if AX unavailable. Nested iframes this session can reach are included under '── 嵌套 frame：… ──' headers (their refs work in click/type/exec); iframes it cannot read (cross-process/cross-origin) are listed in a final '⚠ … 未包含在上方快照中' disclosure — never assume the page has only what you see when that line is present.",
             json_props! {
                 "full" => obj!("type"="boolean","default"=false,"description"="Include hidden elements too"),
                 "selector" => obj!("type"="string","description"="Scope snapshot to this subtree")
