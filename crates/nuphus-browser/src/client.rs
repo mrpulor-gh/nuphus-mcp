@@ -4997,7 +4997,10 @@ mod tests {
         );
     }
 
-    /** Recovery must retain the selected target and its unsaved document state. */
+    /**
+     * Recovery must retain the selected target and its unsaved document state.
+     * Finish fixture navigation before seeding state so initial loading cannot erase it.
+     */
     #[tokio::test]
     #[ignore = "launches real Chrome; requires Chrome installed locally"]
     async fn quiet_tabs_reconnect_preserves_selected_page() {
@@ -5007,10 +5010,11 @@ mod tests {
             .navigate(&fixture_url("quiet_reconnect", STATIC_PAGE))
             .await
             .expect("navigate");
+        client.new_tab(None).await.expect("selected tab");
         client
-            .new_tab(Some(&fixture_url("quiet_reconnect_selected", STATIC_PAGE)))
+            .navigate(&fixture_url("quiet_reconnect_selected", STATIC_PAGE))
             .await
-            .expect("selected tab");
+            .expect("selected fixture loaded");
         client
             .evaluate("window.unsaved = 'keep-me'")
             .await
@@ -5156,7 +5160,10 @@ mod tests {
         assert_eq!(active, "visible", "explicit activation must still work");
     }
 
-    /** An external CDP reconnect must restore the chosen target without closing its owner. */
+    /**
+     * An external CDP reconnect must restore the chosen target without closing its owner.
+     * Seed unsaved state only after the target fixture finishes its initial navigation.
+     */
     #[tokio::test]
     #[ignore = "launches real Chrome; requires Chrome installed locally"]
     async fn quiet_tabs_external_reattach_preserves_selection() {
@@ -5172,10 +5179,11 @@ mod tests {
         let mut client = isolated_client("quiet_external_client");
         client.external_cdp_url = Some(format!("http://127.0.0.1:{port}"));
         client.launch(true).await.expect("external attach");
+        client.new_tab(None).await.expect("task tab");
         client
-            .new_tab(Some(&fixture_url("quiet_external_target", STATIC_PAGE)))
+            .navigate(&fixture_url("quiet_external_target", STATIC_PAGE))
             .await
-            .expect("task tab");
+            .expect("task fixture loaded");
         client
             .evaluate("window.unsaved = 'external-state'")
             .await
