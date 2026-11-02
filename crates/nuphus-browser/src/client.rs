@@ -6,12 +6,14 @@
 //! - Login state persistence (--user-data-dir)
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::page::{
+    CaptureScreenshotFormat, CaptureScreenshotParams, Viewport as ScreenshotViewport,
+};
 use chromiumoxide::cdp::browser_protocol::target::{
     CreateTargetParams, GetTargetsParams, TargetId,
 };
 use chromiumoxide::cdp::js_protocol::runtime::RemoteObjectId;
 use chromiumoxide::handler::viewport::Viewport;
-use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::{Command, Handler, Method, Page};
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -3356,19 +3358,52 @@ impl BrowserClient {
         Ok(value)
     }
 
-    /// Screenshot
+    /**
+     * Captures the full task document without activating it or overriding its viewport.
+     * Bypass chromiumoxide's screenshot helper, which activates the target and changes device metrics.
+     */
     pub async fn screenshot(&self, path: Option<&str>) -> Result<String, BrowserError> {
         let page = self.get_page().await?;
         let page_guard = page.lock().await;
 
-        let data = cdp(page_guard.screenshot(ScreenshotParams {
-            full_page: Some(true),
-            omit_background: None,
-            cdp_params: Default::default(),
-        }))
-        .await?;
+        let content = cdp_ctx("Screenshot layout", page_guard.layout_metrics())
+            .await?
+            .css_content_size;
+        let image = tokio::time::timeout(
+            CDP_CALL_TIMEOUT,
+            page_guard.execute(CaptureScreenshotParams {
+                format: Some(CaptureScreenshotFormat::Png),
+                clip: Some(ScreenshotViewport {
+                    x: content.x,
+                    y: content.y,
+                    width: content.width,
+                    height: content.height,
+                    scale: 1.0,
+                }),
+                from_surface: Some(true),
+                capture_beyond_viewport: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|_| {
+            BrowserError::Execution(
+                "Screenshot timed out without activating the task tab. Chrome may throttle \
+                 background rendering. Use browser_snapshot or browser_extract; activate the \
+                 tab only if the user explicitly requests foreground interaction. \
+                 No automatic activation or retry was performed."
+                    .into(),
+            )
+        })?
+        .map_err(|error| cdp_err_ctx("Screenshot capture", error))?
+        .result;
+        let b64 = String::from(image.data);
 
         if let Some(path) = path {
+            use base64::Engine;
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(&b64)
+                .map_err(|e| BrowserError::Execution(format!("Invalid screenshot data: {e}")))?;
             std::fs::write(path, &data).map_err(BrowserError::Io)?;
             Ok(format!(
                 "Screenshot saved to: {} ({} bytes)",
@@ -3376,9 +3411,6 @@ impl BrowserClient {
                 data.len()
             ))
         } else {
-            // Return Base64
-            use base64::Engine;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
             Ok(format!("data:image/png;base64,{}", b64))
         }
     }
@@ -4943,6 +4975,152 @@ mod tests {
             visibility, "visible",
             "switching automation targets must not activate them"
         );
+    }
+
+    /** Inline screenshots preserve the user's tab even if Chrome throttles repeated captures. */
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn quiet_tabs_screenshot_inline_keeps_user_tab_visible() {
+        screenshot_preserves_foreground("quiet_screenshot_inline", false).await;
+    }
+
+    /** File screenshots have the same background behavior, including Chinese save paths. */
+    #[tokio::test]
+    #[ignore = "launches real Chrome; requires Chrome installed locally"]
+    async fn quiet_tabs_screenshot_file_keeps_user_tab_visible() {
+        screenshot_preserves_foreground("quiet_screenshot_file", true).await;
+    }
+
+    /** Requires a full-page PNG first, then accepts only PNGs or explicit non-activating timeouts. */
+    async fn screenshot_preserves_foreground(profile: &str, save: bool) {
+        use base64::Engine;
+
+        let mut client = isolated_client(profile);
+        client.launch(true).await.expect("launch");
+        client
+            .navigate(&fixture_url(
+                &format!("{profile}_target"),
+                "<!doctype html><meta charset='utf-8'><style>body{margin:0;height:3000px;background:linear-gradient(red,blue)}</style><input value='未保存内容'>",
+            ))
+            .await
+            .expect("task page");
+        let target = client.get_page().await.unwrap().lock().await.clone();
+        cdp(target.evaluate("document.querySelector('input').value = '未保存的修改';"))
+            .await
+            .unwrap();
+        client
+            .new_tab(Some(&fixture_url(&format!("{profile}_user"), STATIC_PAGE)))
+            .await
+            .expect("user page");
+        let user_page = client.get_page().await.unwrap().lock().await.clone();
+        cdp(user_page.bring_to_front())
+            .await
+            .expect("user selects tab");
+        let tabs = client.list_tabs().await.unwrap();
+        let index = tabs
+            .iter()
+            .find(|t| t["target_id"].as_str() == Some(target.target_id().as_ref()))
+            .unwrap()["index"]
+            .as_u64()
+            .unwrap() as usize;
+        client
+            .switch_tab(index)
+            .await
+            .expect("background selection");
+        let observe = "window.__quietEvents = []; document.addEventListener('visibilitychange', () => window.__quietEvents.push(document.visibilityState)); window.addEventListener('focus', () => window.__quietEvents.push('focus')); window.addEventListener('blur', () => window.__quietEvents.push('blur'));";
+        let state = "({visibility:document.visibilityState,focus:document.hasFocus(),events:window.__quietEvents,width:innerWidth,height:innerHeight,input:document.querySelector('input')?.value ?? null})";
+        for page in [&target, &user_page] {
+            cdp(page.evaluate(observe)).await.unwrap();
+        }
+        let before_user: serde_json::Value = cdp(user_page.evaluate(state))
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        let before_target: serde_json::Value = cdp(target.evaluate(state))
+            .await
+            .unwrap()
+            .into_value()
+            .unwrap();
+        assert_eq!(before_user["visibility"], "visible");
+        assert_eq!(before_target["visibility"], "hidden");
+        let saved_path = std::env::temp_dir().join(format!(
+            "nuphus-截图 空格-{profile}-{}.png",
+            std::process::id()
+        ));
+        let mut observations = Vec::new();
+        for attempt in 0..3 {
+            let output = client
+                .screenshot(if save { saved_path.to_str() } else { None })
+                .await;
+            let png = match output {
+                Ok(output) => Some(if save {
+                    std::fs::read(&saved_path).expect("saved PNG")
+                } else {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(
+                            output
+                                .strip_prefix("data:image/png;base64,")
+                                .expect("PNG data URL"),
+                        )
+                        .expect("base64")
+                }),
+                Err(error) => {
+                    assert!(attempt > 0, "first screenshot must produce a PNG: {error}");
+                    assert!(
+                        !BrowserClient::is_connection_error(&error),
+                        "a throttled capture must not trigger connection recovery"
+                    );
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("Screenshot timed out without activating"),
+                        "unexpected error: {error}"
+                    );
+                    None
+                }
+            };
+            let user: serde_json::Value = cdp(user_page.evaluate(state))
+                .await
+                .unwrap()
+                .into_value()
+                .unwrap();
+            let task: serde_json::Value = cdp(target.evaluate(state))
+                .await
+                .unwrap()
+                .into_value()
+                .unwrap();
+            observations.push((png, user, task));
+        }
+        let selected_id = client
+            .get_page()
+            .await
+            .unwrap()
+            .lock()
+            .await
+            .target_id()
+            .clone();
+        client.close().await.expect("close");
+        cleanup_profile(profile);
+        if save {
+            std::fs::remove_file(saved_path).expect("remove screenshot fixture");
+        }
+        assert_eq!(selected_id, *target.target_id());
+        for (png, user, task) in observations {
+            assert_eq!(user, before_user, "screenshots must preserve the user's foreground tab and focus, without transient activation");
+            assert_eq!(
+                task, before_target,
+                "screenshots must preserve task visibility, viewport and unsaved input"
+            );
+            if let Some(png) = png {
+                assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+                let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
+                assert!(
+                    height >= 3000,
+                    "capture the full task document, not the short foreground page: {height}"
+                );
+            }
+        }
     }
 
     /** Explicit new tabs stay in the background and become the next operation's target. */

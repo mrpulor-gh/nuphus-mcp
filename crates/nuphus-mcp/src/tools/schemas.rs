@@ -467,7 +467,7 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "browser_screenshot",
-            "Screenshot the current browser page. With `path` saves a PNG to disk (path validated); without `path` returns a base64 data URI for inline reading.",
+            "Capture a full-page PNG of the selected task tab without activating it or changing foreground focus. Do not activate merely to take screenshots. If Chrome throttles background rendering, capture returns a bounded timeout without automatic activation or retry; prefer browser_snapshot/browser_extract, and activate only if the user explicitly requests foreground interaction. With `path` saves a PNG to disk (path validated); without `path` returns a base64 data URI for inline reading.",
             json_props! {
                 "path" => obj!("type"="string","description"="Optional save path for the PNG file (parent directory must exist); omit to get a base64 data URI instead")
             },
