@@ -918,9 +918,21 @@ are removed before reading, then 5 pickers are tried in order — `article` →
 
 ### browser_screenshot
 
-Screenshot the current browser page. With `path` the PNG is saved to disk
+Capture a full-page PNG of the selected task tab without activating it or changing
+foreground focus. No `activate: true` is needed
+before screenshots; reserve activation for explicitly requested foreground interaction.
+With `path` the PNG is saved to disk
 (path validated, parent directory must exist); without `path` a base64 data
 URI is returned for inline reading.
+
+Chrome may stop producing frames for background tabs, especially on repeated
+captures. A capture that does not respond within 5 seconds returns an actionable
+error without activating the page or automatically retrying/reconnecting for that
+timeout. Use `browser_snapshot` or `browser_extract` to continue background work;
+activate the tab only if the user explicitly requests foreground interaction.
+Background image capture is therefore best effort, not guaranteed on every Chrome state.
+Full-page capture uses Chrome's compositor and may affect the task page's scroll
+position; it does not replace the document or modify device-metrics emulation settings.
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
