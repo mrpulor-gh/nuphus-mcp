@@ -431,11 +431,14 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def_with_selector_or_ref(
             "browser_type",
-            "Type text into input by CSS selector or @N ref. Auto-waits for visibility (5s).",
+            "Type text into an editable control by CSS selector or @N ref. Verifies input receipt in the target frame, including terminal textareas; receipt does not prove application processing or command execution. Auto-waits for CSS visibility (5s).",
             json_props! {
                 "selector" => obj!("type"="string","minLength"=1,"description"="CSS selector or ref ID of input field (e.g. @1, @e0)"),
                 "ref" => obj!("type"="string","minLength"=1,"description"="Ref ID from snapshot (e.g. @1, @e0); alias of selector — provide either one"),
-                "text" => obj!("type"="string","description"="Text to type")
+                "text" => obj!("type"="string","description"="Text to type"),
+                "clear" => obj!("type"="boolean","default"=true,"description"="Replace existing field content by default. Set false to preserve the current content/selection, especially for terminal input; this does not clear a terminal's shell buffer."),
+                "mode" => obj!("type"="string","enum"=["insert","paste"],"default"="insert","description"="insert uses native text insertion; paste dispatches a DOM paste to a current @N editable control without touching the system clipboard; it does not clear the shell buffer"),
+                "snapshot" => obj!("type"="boolean","default"=true,"description"="Set false when the next step reads a specific result, avoiding a full AX snapshot")
             },
             &["text"],
         ),
@@ -481,9 +484,10 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "browser_evaluate",
-            "Execute arbitrary JavaScript in the current page.",
+            "Execute JavaScript in the selected page, or in the owning DOM frame of a current snapshot ref. With ref, this is the resolved element; use DOM operations for UI work.",
             json_props! {
-                "script" => obj!("type"="string","description"="JavaScript code")
+                "script" => obj!("type"="string","description"="JavaScript expression; async scripts containing await must return their result"),
+                "ref" => obj!("type"="string","description"="Optional current @N snapshot ref selecting the owning frame; this is that element")
             },
             &["script"],
         ),

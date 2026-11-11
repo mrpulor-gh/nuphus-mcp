@@ -363,9 +363,8 @@ impl Command for DOMDescribeNode {
 }
 
 /// CDP `Input.insertText` — dispatches real text input event to the focused element.
-/// Triggers full event chain (keydown/keypress/beforeinput/input/keyup) that
-/// React/Vue controlled components listen to. Unlike setting `this.value` via JS,
-/// this is indistinguishable from real user typing.
+/// Sends text input, including beforeinput/input events; it does not synthesize
+/// the physical keydown/keyup sequence (use press_key for physical keys).
 #[derive(Debug, Clone, Serialize)]
 struct InputInsertText {
     text: String,
@@ -2440,79 +2439,68 @@ impl BrowserClient {
         Ok((x, y))
     }
 
-    /// Type text into element (via @N ref from AX snapshot, @eN legacy ref, or CSS selector)
+    /// Replace text (legacy API). MCP callers can explicitly preserve content.
     pub async fn type_text(&self, selector: &str, text: &str) -> Result<String, BrowserError> {
+        self.type_text_with_options(selector, text, true).await
+    }
+
+    /// Deliver text once, verifying receipt in the target's own frame. Never use
+    /// top-level DOM mutations as proof that an iframe terminal accepted input.
+    pub async fn type_text_with_options(
+        &self,
+        selector: &str,
+        text: &str,
+        clear: bool,
+    ) -> Result<String, BrowserError> {
         let page = self.get_page().await?;
         let page_guard = page.lock().await;
-
-        // New AX tree ref: @N
-        if let Some(idx_str) = selector.strip_prefix('@') {
+        let object_id = if let Some(idx_str) = selector.strip_prefix('@') {
             if let Ok(idx) = idx_str.parse::<usize>() {
                 let (backend_id, frame_label) = self.ax_ref(idx)?;
-                return self
-                    .retry_on_stale(|| {
-                        self.type_via_backend_node_id(
-                            &page_guard,
-                            backend_id,
-                            selector,
-                            text,
-                            frame_label,
+                self.resolve_backend_node(&page_guard, backend_id, frame_label)
+                    .await?
+            } else if let Some(idx) = idx_str
+                .strip_prefix('e')
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                let elements =
+                    cdp(page_guard.find_elements("a, button, input, textarea, select, [onclick]"))
+                        .await?;
+                elements
+                    .get(idx)
+                    .ok_or_else(|| {
+                        BrowserError::ElementNotFound(
+                            selector.to_string(),
+                            "legacy ref out of range".to_string(),
                         )
-                    })
-                    .await;
+                    })?
+                    .remote_object_id
+                    .clone()
+            } else {
+                return Err(BrowserError::ElementNotFound(
+                    selector.to_string(),
+                    "invalid ref".to_string(),
+                ));
             }
-        }
-
-        // Legacy @eN ref — focus+clear via JS, then Input.insertText for real input
-        if let Some(idx_str) = selector.strip_prefix("@e") {
-            if let Ok(idx) = idx_str.parse::<usize>() {
-                let js = format!(
-                    r#"(function() {{
-                        const els = document.querySelectorAll('a, button, input, textarea, select, [onclick]');
-                        const i = parseInt({idx});
-                        if (!els[i]) throw new Error('Element @e{idx} not found');
-                        const el = els[i];
-                        el.scrollIntoViewIfNeeded();
-                        el.focus();
-                        el.value = '';
-                        return true;
-                    }})()"#,
-                    idx = idx,
-                );
-                cdp(page_guard.evaluate(js)).await?;
-
-                let input_cmd = InputInsertText {
-                    text: text.to_string(),
-                };
-                cdp_ctx(
-                    &format!("Input.insertText on @e{}", idx),
-                    page_guard.execute(input_cmd),
-                )
-                .await?;
-                return Ok(format!("Typed '{}' into @e{}", text, idx));
-            }
-        }
-
-        // CSS selector — auto-wait (presence + visible), then focus+clear via JS,
-        // then Input.insertText for real input
-        let js = Self::actionability_script(selector, "el.focus(); el.value=''; return true;");
-        cdp_ctx_with_timeout(
-            &format!("Type focus on '{}' failed", selector),
-            ACTIONABILITY_CDP_BUDGET,
-            page_guard.evaluate(js),
-        )
-        .await?;
-
-        let input_cmd = InputInsertText {
-            text: text.to_string(),
+        } else {
+            let js = Self::actionability_script(selector, "return true;");
+            cdp_ctx_with_timeout(
+                "Type target wait failed",
+                ACTIONABILITY_CDP_BUDGET,
+                page_guard.evaluate(js),
+            )
+            .await?;
+            cdp(page_guard.find_element(selector))
+                .await?
+                .remote_object_id
         };
-        cdp_ctx(
-            &format!("Input.insertText on '{}'", selector),
-            page_guard.execute(input_cmd),
-        )
-        .await?;
+        self.type_into_object(&page_guard, object_id, selector, text, clear)
+            .await
+    }
 
-        Ok(format!("Typed '{}' into {}", text, selector))
+    /// Validate a key chord without connecting to a browser or dispatching input.
+    pub fn validate_key_chord(chord: &str) -> Result<(), BrowserError> {
+        parse_key_chord(chord).map(|_| ())
     }
 
     /// Press a physical keyboard key or chord on the currently focused element.
@@ -2817,54 +2805,78 @@ impl BrowserClient {
         Ok(format!("Clicked {}", displayed))
     }
 
-    /// Type text into an element by its backendNodeId via CDP DOM.resolveNode + Runtime.callFunctionOn.
-    /// Uses a custom CDP command to avoid chromiumoxide's auto-injection of `executionContextId`.
-    async fn type_via_backend_node_id(
+    async fn type_into_object(
         &self,
         page: &Page,
-        backend_node_id: u32,
+        object_id: RemoteObjectId,
         selector: &str,
         text: &str,
-        frame_label: Option<&str>,
+        clear: bool,
     ) -> Result<String, BrowserError> {
-        let displayed = Self::ref_with_frame(selector, frame_label);
-        let object_id = self
-            .resolve_backend_node(page, backend_node_id, frame_label)
-            .await?;
-
-        // Step 1: Focus the target element (scroll into view + clear + focus)
-        let focus_func =
-            "function(){ this.scrollIntoViewIfNeeded(); this.focus(); this.value=''; }";
-        let focus_cmd = RuntimeCallFunctionOn {
-            function_declaration: focus_func.to_string(),
+        let probe = |finish| RuntimeCallFunctionOn {
+            function_declaration: format!(
+                "function(){{ return ({}).call(this, {}, {}); }}",
+                include_str!("type_probe.js"),
+                clear,
+                finish
+            ),
             object_id: Some(object_id.inner().clone()),
             return_by_value: Some(true),
             await_promise: Some(true),
         };
-
-        let focus_resp = cdp_ctx("Type focus failed", page.execute(focus_cmd)).await?;
-
-        if let Some(details) = focus_resp.result.get("exceptionDetails") {
-            let desc = details
-                .get("exception")
-                .and_then(|e| e.get("description"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown exception");
+        let prepared = cdp_ctx("Type focus/probe failed", page.execute(probe(false))).await?;
+        if let Some(details) = prepared.result.get("exceptionDetails") {
             return Err(BrowserError::Execution(format!(
-                "Type JS exception on {}: {}",
-                displayed, desc
+                "Type target {} is not ready: {}",
+                selector, details
             )));
         }
-
-        // Step 2: Use CDP Input.insertText to dispatch real text input.
-        // This triggers the full browser event chain (keydown/keypress/beforeinput/input/keyup),
-        // which React/Vue controlled components require to update their internal state.
-        let input_cmd = InputInsertText {
-            text: text.to_string(),
+        // No retry after dispatch: a lost response must not duplicate terminal input.
+        let dispatched = if text.is_empty() && !clear {
+            Ok(())
+        } else {
+            cdp_ctx(
+                "Input.insertText failed (delivery may be unknown; inspect before retrying)",
+                page.execute(InputInsertText {
+                    text: text.to_string(),
+                }),
+            )
+            .await
+            .map(|_| ())
         };
-        cdp_ctx("Input.insertText failed", page.execute(input_cmd)).await?;
-
-        Ok(format!("Typed '{}' into {}", text, displayed))
+        // Cleanup is attempted even when dispatch fails; a bounded page timer also
+        // cleans up if the transport disconnects before this request arrives.
+        let checked = cdp_ctx(
+            "Type receipt verification failed; inspect before retrying",
+            page.execute(probe(true)),
+        )
+        .await;
+        dispatched?;
+        let checked = checked?;
+        if checked.result.get("exceptionDetails").is_some() {
+            return Err(BrowserError::Execution(format!(
+                "Text dispatched to {} but receipt is unknown; inspect before retrying",
+                selector
+            )));
+        }
+        let received = checked
+            .result
+            .pointer("/result/value")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !text.is_empty() && !received {
+            return Err(BrowserError::Execution(format!(
+                "Text dispatched to {} but no trusted input event reached the target. Input may have been blocked. Inspect the field or terminal before retrying; do not blindly resend.", selector
+            )));
+        }
+        Ok(if text.is_empty() {
+            format!(
+                "Empty text operation on {} (clear={}); inspect current field state",
+                selector, clear
+            )
+        } else {
+            format!("Typed into {}: target received input. This confirms input delivery, not application processing or command execution; verify the field or terminal before the next action.", selector)
+        })
     }
 
     /// Resolve a backendNodeId to a RemoteObjectId via CDP DOM.resolveNode.
@@ -3463,6 +3475,88 @@ impl BrowserClient {
         let value = result.into_value().unwrap_or(serde_json::Value::Null);
 
         Ok(value)
+    }
+
+    /// Evaluate in the owning DOM frame of an existing snapshot ref. The
+    /// resolved element is `this`; no network transport or page-private API.
+    pub async fn evaluate_at_ref(
+        &self,
+        script: &str,
+        selector: &str,
+    ) -> Result<serde_json::Value, BrowserError> {
+        let idx = selector
+            .strip_prefix('@')
+            .and_then(|s| s.parse::<usize>().ok())
+            .ok_or_else(|| {
+                BrowserError::Execution("evaluate ref must be a current @N snapshot ref".into())
+            })?;
+        let (backend_id, frame_label) = self.ax_ref(idx)?;
+        let page = self.get_page().await?;
+        let page_guard = page.lock().await;
+        let object_id = self
+            .resolve_backend_node(&page_guard, backend_id, frame_label)
+            .await?;
+        let expression = if script.contains("await") {
+            format!("(async () => {{\n{}\n}})()", script)
+        } else {
+            script.to_string()
+        };
+        let quoted = serde_json::to_string(&expression)
+            .map_err(|e| BrowserError::Execution(e.to_string()))?;
+        let response = cdp_ctx(
+            "Frame DOM evaluation failed",
+            page_guard.execute(RuntimeCallFunctionOn {
+                function_declaration: format!("function(){{ return eval({}); }}", quoted),
+                object_id: Some(object_id.inner().clone()),
+                return_by_value: Some(true),
+                await_promise: Some(true),
+            }),
+        )
+        .await?;
+        if let Some(details) = response.result.get("exceptionDetails") {
+            return Err(BrowserError::Execution(format!(
+                "Frame DOM script failed: {}",
+                details
+            )));
+        }
+        Ok(response
+            .result
+            .pointer("/result/value")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Dispatch a normal DOM paste to an existing editable target. Useful for
+    /// terminal widgets that receive insertText but ignore it without key events.
+    pub async fn paste_text_at_ref(
+        &self,
+        selector: &str,
+        text: &str,
+    ) -> Result<String, BrowserError> {
+        let text =
+            serde_json::to_string(text).map_err(|e| BrowserError::Execution(e.to_string()))?;
+        let script = format!(
+            r#"(function() {{
+            const el = this;
+            if (!el.isConnected || el.disabled || el.readOnly || el.closest('[inert]'))
+                throw new Error('Paste target is not editable');
+            if (!el.matches('input,textarea,[contenteditable="true"]'))
+                throw new Error('Paste requires an editable control');
+            el.focus();
+            if (el.getRootNode().activeElement !== el) throw new Error('Paste target is not focused');
+            const data = new DataTransfer(); data.setData('text/plain', {text});
+            const event = new ClipboardEvent('paste', {{clipboardData:data,bubbles:true,cancelable:true}});
+            const handled = !el.dispatchEvent(event);
+            return {{handled}};
+        }}).call(this)"#
+        );
+        self.evaluate_at_ref(&script, selector).await?;
+        // xterm can consume paste without preventDefault. Cancellation is not
+        // application evidence; the following DOM/result check decides success.
+        Ok(format!(
+            "Paste dispatched to {}. Verify application output before proceeding.",
+            selector
+        ))
     }
 
     /// Browser back
