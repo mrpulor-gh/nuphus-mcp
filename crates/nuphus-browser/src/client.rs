@@ -636,11 +636,6 @@ const NAVIGATE_DOM_READY_SECS: u64 = 12;
 /// stalls the whole tool for 30s. Wrapping every raw CDP call in [`cdp`] caps
 /// each at this budget and fails fast with a clear error instead.
 const CDP_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-/// Effect-verification window (ms) for `browser_press`: a key that changes
-/// nothing within this window is reported instead of silently passing as
-/// "pressed". Kept short on purpose — many keys are legitimately inert
-/// (arrows on a static page), so a missing reaction is a note, not an error.
-const PRESS_EFFECT_WINDOW_MS: u64 = 2000;
 /// Budget for one page creation round trip. A wedged CDP connection (renderer
 /// replaced mid-navigation, dead browser) must fail fast with a readable error
 /// instead of holding the tool budget until the outer guard fires.
@@ -2554,40 +2549,13 @@ impl BrowserClient {
             .map_err(|e| BrowserError::Execution(format!("keyUp build: {e}")))?;
 
         let page = self.get_page().await?;
-        // Arm the change detector BEFORE dispatching. Without this a key the page
-        // silently drops passes as a successful "Pressed …" — most commonly when
-        // the tab is not the focused/visible one, so CDP input never reaches the
-        // document at all (verified: `document.hasFocus() === false` swallows
-        // `Input.dispatchKeyEvent`). click/type already do this; press must too.
-        // Armed before the page lock is taken: arming itself locks the page.
-        // Best-effort: a detector problem must never block the key dispatch —
-        // it only downgrades the verification below.
-        if let Err(e) = self.arm_change_detector().await {
-            tracing::debug!("[Browser] change detector could not be armed before press: {e}");
-        }
-
         let page_guard = page.lock().await;
         cdp_ctx("keyboard keyDown failed", page_guard.execute(key_down)).await?;
         cdp_ctx("keyboard keyUp failed", page_guard.execute(key_up)).await?;
         drop(page_guard);
 
-        // Effect verification. A missing reaction is a note, not a failure: many
-        // keys are legitimately inert (arrows on a static page). The point is
-        // that the caller learns the difference instead of proceeding on a
-        // false "the key was pressed" premise.
-        let reacted = self
-            .wait_for_change(PRESS_EFFECT_WINDOW_MS)
-            .await
-            .unwrap_or(false);
-        if reacted {
-            return Ok(format!("Pressed {chord}"));
-        }
         Ok(format!(
-            "Pressed {chord}\n\n⚠ No page reaction within {PRESS_EFFECT_WINDOW_MS}ms: the key \
-             was dispatched but nothing changed. Either the key is inert on this page, or the \
-             tab is not the focused/visible one (CDP input is dropped while \
-             `document.hasFocus()` is false). Confirm with browser_snapshot, and use \
-             browser_switch_tab with activate=true only if foreground interaction is needed."
+            "Dispatched {chord}; verify the intended field/terminal state. Key dispatch does not prove command execution."
         ))
     }
 

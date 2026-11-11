@@ -419,12 +419,13 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def_with_selector_or_ref(
             "browser_click",
-            "Click element by CSS selector or @N ref. Auto-waits for visibility (5s). Left clicks default to JS click (no user activation); trusted=true sends real CDP events. Right/middle clicks always trusted.",
+            "Dispatch click by CSS selector or @N ref. Auto-waits for CSS visibility (5s). Left clicks default to JS click; trusted=true sends real CDP events. Right/middle always trusted. Verify the intended UI outcome; no default DOM-change wait (iframe/canvas effects may be invisible to it).",
             json_props! {
                 "selector" => obj!("type"="string","minLength"=1,"description"="CSS selector or ref ID (e.g. @1, @e0, 'button')"),
                 "ref" => obj!("type"="string","minLength"=1,"description"="Ref ID from snapshot (e.g. @1, @e0); alias of selector — provide either one"),
                 "trusted" => obj!("type"="boolean","description"="Dispatch real trusted CDP mouse events at the element's center (produces user activation). Default false for left clicks; right and middle clicks are always trusted."),
                 "button" => obj!("type"="string","enum"=["left","right","middle"],"default"="left","description"="Mouse button. Right and middle clicks use trusted CDP events automatically."),
+                "observe_change" => obj!("type"="boolean","default"=false,"description"="Optionally observe top-level page changes after a left click. This cannot prove success/failure in iframe or canvas applications. Prefer checking the specific intended UI state."),
                 "snapshot" => obj!("type"="boolean","description"="Include a post-click page snapshot. Defaults to true for left clicks and false for right/middle clicks so transient context menus remain open for the next operation.")
             },
             &[],
