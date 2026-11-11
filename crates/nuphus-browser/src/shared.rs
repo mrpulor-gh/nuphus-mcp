@@ -40,6 +40,20 @@ const SHARED_CLIENT_LOCK_TIMEOUT_SECS: u64 = 30;
 pub async fn get_or_launch(
     headless: bool,
 ) -> Result<OwnedMutexGuard<Option<BrowserClient>>, String> {
+    get_or_launch_inner(headless, false).await
+}
+
+/// MCP sessions own distinct task tabs, while sharing the Chrome process.
+pub async fn get_or_launch_isolated(
+    headless: bool,
+) -> Result<OwnedMutexGuard<Option<BrowserClient>>, String> {
+    get_or_launch_inner(headless, true).await
+}
+
+async fn get_or_launch_inner(
+    headless: bool,
+    isolated: bool,
+) -> Result<OwnedMutexGuard<Option<BrowserClient>>, String> {
     // Bounded acquisition: this mutex is process-wide and every browser tool
     // takes it, so a wedged previous operation must not turn every later call
     // into an unbounded wait (that failure mode reads as "the whole tool family
@@ -59,8 +73,11 @@ pub async fn get_or_launch(
         }
     };
     if guard.is_none() {
-        let client =
+        let mut client =
             BrowserClient::new().map_err(|e| format!("Browser automation unavailable: {}", e))?;
+        if isolated {
+            client.enable_tab_isolation(crate::coordination::Coordination::default());
+        }
         *guard = Some(client);
     }
     let client = guard.as_mut().expect("client just initialized");
@@ -71,14 +88,9 @@ pub async fn get_or_launch(
     Ok(guard)
 }
 
-/// Explicitly shut down the shared browser. Call before process exit.
-///
-/// The shared BrowserClient lives in a process-level `static` (`OnceLock`), and Rust statics are
-/// never dropped on process exit — so `kill_on_drop` on the Chrome child can never fire on its own,
-/// and a gracefully-exiting server would otherwise leave an orphaned Chrome holding the profile lock.
-/// This is the reliable cleanup path: close the CDP connection and kill a Chrome instance this
-/// process launched. An attached external/user browser is only disconnected, never killed.
-/// Bounded to 5s so a wedged CDP connection cannot block process shutdown.
+/// Release the shared client before process exit. Cooperative MCP clients only
+/// disconnect and release their tab claim; legacy standalone clients retain
+/// their close/kill behavior. Bound CDP cleanup to five seconds.
 pub async fn shutdown_browser() {
     let shared = shared_client();
     let mut guard = shared.lock().await;

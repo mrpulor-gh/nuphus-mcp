@@ -168,7 +168,10 @@ impl McpServer {
             },
             "instructions": "Nuphus MCP Server — AI computer operation capability (desktop + browser). \
                              desktop_* tools operate the local screen/windows/keyboard/mouse; browser_* tools \
-                             operate Chrome (CDP). Activate the target window with desktop_window_activate before window operations.",
+                             operate Chrome (CDP). Each session owns its selected tab until switching or browser_close. \
+                             Separate tabs can run concurrently; prefer stable target_id when switching. \
+                             browser_close disconnects only this session, leaving shared Chrome open. \
+                             Activate the target window with desktop_window_activate before window operations.",
         }))
     }
 

@@ -560,6 +560,9 @@ pub struct ExternalIdentity {
 
 /// Browser client
 pub struct BrowserClient {
+    coordination: Option<crate::coordination::Coordination>,
+    browser_identity: Option<String>,
+    tab_lease: Option<(String, crate::coordination::ResourceGuard)>,
     /// Chrome executable path
     chrome_path: PathBuf,
     /// Profile directory (login state persistence)
@@ -1156,6 +1159,9 @@ impl BrowserClient {
         let download_dir = profile_dir.join("downloads");
 
         Ok(Self {
+            coordination: None,
+            browser_identity: None,
+            tab_lease: None,
             chrome_path,
             profile_dir,
             browser: None,
@@ -1180,6 +1186,9 @@ impl BrowserClient {
         let download_dir = profile_dir.join("downloads");
 
         Ok(Self {
+            coordination: None,
+            browser_identity: None,
+            tab_lease: None,
             chrome_path,
             profile_dir,
             browser: None,
@@ -1196,6 +1205,89 @@ impl BrowserClient {
             external_cdp_url: Self::external_cdp_url_from_env(),
             external_identity: Self::external_identity_from_env(),
         })
+    }
+
+    /// Enable task-tab isolation before connecting. Standalone library consumers
+    /// retain their existing lifecycle unless they explicitly opt into cooperation.
+    pub fn enable_tab_isolation(&mut self, coordination: crate::coordination::Coordination) {
+        assert!(self.browser.is_none(), "enable isolation before launch");
+        self.coordination = Some(coordination);
+    }
+
+    /// Canonical browser UUID from the resolved WebSocket endpoint, independent
+    /// of HTTP hostname aliases and of the process attaching to it.
+    pub fn browser_identity(&self) -> Option<&str> {
+        self.browser_identity.as_deref()
+    }
+
+    fn set_browser_identity(&mut self, ws_url: &str) {
+        let identity = ws_url.rsplit('/').next().unwrap_or(ws_url).to_string();
+        if self.browser_identity.as_ref() != Some(&identity) {
+            self.tab_lease = None;
+            self.browser_identity = Some(identity);
+        }
+    }
+
+    fn claim_page(&mut self, target: &TargetId) -> Result<(), BrowserError> {
+        if let Some(coordination) = &self.coordination {
+            let target = target.as_ref();
+            if self.tab_lease.as_ref().is_some_and(|(id, _)| id == target) {
+                return Ok(());
+            }
+            let identity = self
+                .browser_identity
+                .as_deref()
+                .ok_or(BrowserError::NotStarted)?;
+            let lease = coordination
+                .tab(identity, target)
+                .map_err(BrowserError::Execution)?;
+            // Acquire the new target before releasing the previous target. A busy
+            // switch leaves the old selection and its snapshot references intact.
+            self.tab_lease = Some((target.to_string(), lease));
+        }
+        Ok(())
+    }
+
+    fn tab_available(&self, target: &TargetId) -> Result<bool, BrowserError> {
+        let Some(coordination) = &self.coordination else {
+            return Ok(true);
+        };
+        if self
+            .tab_lease
+            .as_ref()
+            .is_some_and(|(id, _)| id == target.as_ref())
+        {
+            return Ok(true);
+        }
+        let identity = self
+            .browser_identity
+            .as_deref()
+            .ok_or(BrowserError::NotStarted)?;
+        match coordination.tab(identity, target.as_ref()) {
+            Ok(_) => Ok(true),
+            Err(e) if e.starts_with("Automation is busy:") => Ok(false),
+            Err(e) => Err(BrowserError::Execution(e)),
+        }
+    }
+
+    /// Configure browser-wide download policy under its exclusive resource lock,
+    /// before the caller takes the shared operation guard.
+    pub async fn prepare_shared_settings(&mut self) -> Result<(), BrowserError> {
+        if self.download_configured {
+            return Ok(());
+        }
+        let _guard = self
+            .coordination
+            .as_ref()
+            .map(|c| {
+                c.browser(
+                    self.browser_identity.as_deref().unwrap_or("unconnected"),
+                    true,
+                )
+                .map_err(BrowserError::Execution)
+            })
+            .transpose()?;
+        self.configure_download_dir().await
     }
 
     /// Launch browser.
@@ -1215,6 +1307,17 @@ impl BrowserClient {
     /// [`Self::reconnect`] + [`Self::is_connection_error`]) then resets, relaunches
     /// and retries the operation once.
     pub async fn launch(&mut self, headless: bool) -> Result<(), BrowserError> {
+        let _startup = if self.browser.is_none() {
+            self.coordination
+                .as_ref()
+                .map(|c| {
+                    c.startup(&self.profile_dir)
+                        .map_err(BrowserError::Execution)
+                })
+                .transpose()?
+        } else {
+            None
+        };
         // External CDP endpoint configured (e.g. a user-started anti-detect /
         // fingerprint browser): attach to it and NEVER launch our own Chrome.
         // Falling back silently would run automations in the wrong browser while
@@ -1235,6 +1338,9 @@ impl BrowserClient {
                 if !upgrade {
                     return Ok(()); // Already launched, current mode satisfies the request
                 }
+                if self.coordination.is_some() {
+                    return Err(BrowserError::Execution("Shared Chrome is headless; refusing to restart a browser used by other sessions. Use a separate profile or restart it when idle.".into()));
+                }
                 self.close().await?;
             } else {
                 tracing::debug!(
@@ -1253,6 +1359,11 @@ impl BrowserClient {
             // owned here — close() only drops the connection, the process survives). Probe the
             // user agent and upgrade: kill the process, then fall through to the headed launch.
             if !headless && self.instance_is_headless().await.unwrap_or(false) {
+                if self.coordination.is_some() {
+                    return Err(BrowserError::Execution(
+                        "Shared Chrome is headless; refusing to kill it for a mode change.".into(),
+                    ));
+                }
                 tracing::info!(
                     "[Browser] attached to headless instance; upgrading to headed (profile={})",
                     self.profile_dir.display()
@@ -1466,6 +1577,7 @@ impl BrowserClient {
         spawn_cdp_handler(handler);
 
         self.child_process = Some(child);
+        self.set_browser_identity(&ws_url);
         let browser_arc = Arc::new(Mutex::new(browser));
         self.browser = Some(browser_arc.clone());
         self.launched_headless = Some(headless);
@@ -1541,6 +1653,7 @@ impl BrowserClient {
             "[Browser] attached to running Chrome instance (port={})",
             port
         );
+        self.set_browser_identity(&ws_url);
         let browser_arc = Arc::new(Mutex::new(browser));
         self.browser = Some(browser_arc.clone());
         self.page = None;
@@ -1703,6 +1816,7 @@ impl BrowserClient {
         spawn_cdp_handler(handler);
 
         tracing::info!("[Browser] attached to external browser ({})", base);
+        self.set_browser_identity(&ws_url);
         let browser_arc = Arc::new(Mutex::new(browser));
         self.browser = Some(browser_arc.clone());
         self.page = None;
@@ -3839,6 +3953,21 @@ impl BrowserClient {
 
     /// Close browser
     pub async fn close(&mut self) -> Result<(), BrowserError> {
+        if self.coordination.is_some() {
+            self.detach_shared_child();
+            self.browser = None;
+            self.page = None;
+            self.selected_target_id = None;
+            self.page_creation_pending = false;
+            self.snapshot_refs.clear();
+            self.helpers_injected = false;
+            self.download_configured = false;
+            self.download_config_warning = None;
+            self.launched_headless = None;
+            self.tab_lease = None;
+            self.browser_identity = None;
+            return Ok(());
+        }
         // Only send Browser.close to an instance launched by this process (it terminates the Chrome process);
         // an attached instance belongs to another process — dropping the local connection is enough, we must not close someone else's browser.
         if let Some(browser_arc) = self.browser.take() {
@@ -3884,6 +4013,16 @@ impl BrowserClient {
         }
 
         Ok(())
+    }
+
+    fn detach_shared_child(&mut self) {
+        if let Some(child) = self.child_process.take() {
+            // chromiumoxide sets Tokio kill_on_drop at spawn and exposes no way
+            // to turn it off afterwards. Keep that handle alive until process exit
+            // instead of killing a shared browser. At most one handle is retained
+            // per managed launch; Chrome remains reusable via DevToolsActivePort.
+            std::mem::forget(child);
+        }
     }
 
     /// Update the external CDP endpoint at runtime (UI-driven configuration).
@@ -4057,6 +4196,7 @@ impl BrowserClient {
                 "title": title,
                 "target_id": page.target_id(),
                 "selected": self.selected_target_id.as_ref() == Some(page.target_id()),
+                "available": self.tab_available(page.target_id())?,
             }));
         }
 
@@ -4079,22 +4219,41 @@ impl BrowserClient {
         let browser_guard = browser.lock().await;
         let pages = cdp(browser_guard.pages()).await?;
 
-        if index >= pages.len() {
+        let target_id = pages
+            .get(index)
+            .ok_or_else(|| {
+                BrowserError::Execution(format!(
+                    "Tab index {index} out of range ({} tabs)",
+                    pages.len()
+                ))
+            })?
+            .target_id()
+            .clone();
+        drop(browser_guard);
+        self.switch_tab_by_id(target_id.as_ref(), activate).await
+    }
+
+    /// Stable selection, safe against another session creating/removing tabs.
+    pub async fn switch_tab_by_id(
+        &mut self,
+        target_id: &str,
+        activate: bool,
+    ) -> Result<String, BrowserError> {
+        let browser = self.browser.as_ref().ok_or(BrowserError::NotStarted)?;
+        let browser_guard = browser.lock().await;
+        let targets = cdp(browser_guard.execute(GetTargetsParams::default()))
+            .await?
+            .result
+            .target_infos;
+        if !targets
+            .iter()
+            .any(|t| t.target_id.as_ref() == target_id && t.r#type == "page" && t.subtype.is_none())
+        {
             return Err(BrowserError::Execution(format!(
-                "Tab index {} out of range ({} tabs)",
-                index,
-                pages.len()
+                "Tab target_id {target_id} is closed or unavailable; no other tab was selected."
             )));
         }
-
-        let page = pages
-            .get(index)
-            .ok_or_else(|| BrowserError::Execution("Invalid tab index".to_string()))?;
-
-        if activate {
-            cdp_ctx("bring selected tab to front failed", page.bring_to_front()).await?;
-        }
-
+        let page = cdp(browser_guard.get_page(TargetId::from(target_id.to_string()))).await?;
         let url = cdp(page.url())
             .await
             .unwrap_or_default()
@@ -4103,9 +4262,12 @@ impl BrowserClient {
         let page = page.clone();
         drop(browser_guard);
         self.page_creation_pending = false;
-        self.select_page(page).await;
+        self.select_page(page.clone()).await?;
+        if activate {
+            cdp_ctx("bring selected tab to front failed", page.bring_to_front()).await?;
+        }
 
-        Ok(format!("Switched to tab {}: {}", index, url))
+        Ok(format!("Switched to target {}: {}", target_id, url))
     }
 
     /// Get current page URL
@@ -4168,14 +4330,22 @@ impl BrowserClient {
             .iter()
             .filter(|target| target.r#type == "page" && target.subtype.is_none())
             .collect::<Vec<_>>();
+        let mut available = Vec::new();
+        if self.selected_target_id.is_none() {
+            for target in &pages {
+                if self.tab_available(&target.target_id)? {
+                    available.push(*target);
+                }
+            }
+        }
         let target = if let Some(id) = &self.selected_target_id {
             pages.iter().find(|target| &target.target_id == id).copied()
         } else {
-            pages
+            available
                 .iter()
                 .find(|target| !is_internal_chrome_url(&target.url))
                 .copied()
-                .or_else(|| pages.first().copied())
+                .or_else(|| available.first().copied())
         };
         let Some(target) = target else {
             return Ok(None);
@@ -4203,12 +4373,13 @@ impl BrowserClient {
         let Some(page) = self.existing_task_page(browser_arc).await? else {
             return Ok(false);
         };
-        self.select_page(page).await;
+        self.select_page(page).await?;
         Ok(true)
     }
 
     /** Initializes page-local state only when adopting a new page or connection. */
-    async fn select_page(&mut self, page: Page) {
+    async fn select_page(&mut self, page: Page) -> Result<(), BrowserError> {
+        self.claim_page(page.target_id())?;
         let needs_setup =
             self.page.is_none() || self.selected_target_id.as_ref() != Some(page.target_id());
         self.selected_target_id = Some(page.target_id().clone());
@@ -4221,11 +4392,12 @@ impl BrowserClient {
             let _ = cdp(guard.execute(DOMEnable::default())).await;
             let _ = Self::inject_anti_detection(&guard).await;
         }
-        if !self.download_configured {
+        if self.coordination.is_none() && !self.download_configured {
             if let Err(error) = self.configure_download_dir().await {
                 tracing::warn!("[Browser] download dir config failed on selected page: {error}");
             }
         }
+        Ok(())
     }
 
     /** Refuses blind retries when a create request may have already reached Chrome. */
@@ -4263,13 +4435,21 @@ impl BrowserClient {
     }
 }
 
+impl Drop for BrowserClient {
+    fn drop(&mut self) {
+        if self.coordination.is_some() {
+            self.detach_shared_child();
+        }
+    }
+}
+
 /// Browser error
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserError {
     #[error("Browser not started. Call launch() first.")]
     NotStarted,
 
-    #[error("No page open. Call navigate() first.")]
+    #[error("No task tab selected. Open a new tab, navigate, or select an available target_id from browser_list_tabs.")]
     NoPage,
 
     #[error("Browser config error: {0}")]
@@ -4940,6 +5120,82 @@ mod tests {
 
         let _ = client.close().await;
         cleanup_profile("reconnect");
+    }
+
+    /// Real Chrome regression: isolation, ownership, reconnect and launcher exit.
+    #[tokio::test]
+    #[ignore = "launches isolated headless Chrome"]
+    async fn isolated_tasks_keep_shared_chrome_alive() {
+        use futures_util::FutureExt;
+        let mut a = isolated_client("cooperative_lifecycle");
+        let profile = a.profile_dir.clone();
+        let coordination = crate::coordination::Coordination::at(profile.join("test-locks"));
+        a.enable_tab_isolation(coordination.clone());
+        let outcome = std::panic::AssertUnwindSafe(async {
+            a.launch(true).await.unwrap();
+            a.navigate(&fixture_url(
+                "cooperative_a",
+                "<input id='a' value='upstream'>",
+            ))
+            .await
+            .unwrap();
+            let aid = a.selected_target_id.clone().unwrap();
+            let mut b = isolated_client("cooperative_lifecycle");
+            b.enable_tab_isolation(coordination);
+            b.launch(true).await.unwrap();
+            assert!(b.page.is_none(), "must not adopt A's claimed startup page");
+            b.new_tab(None).await.unwrap();
+            b.navigate(&fixture_url(
+                "cooperative_b",
+                "<input id='b' value='downstream'>",
+            ))
+            .await
+            .unwrap();
+            let bid = b.selected_target_id.clone().unwrap();
+            assert_ne!(aid, bid);
+            assert!(b
+                .switch_tab_by_id(aid.as_ref(), false)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("busy"));
+            assert_eq!(b.selected_target_id.as_ref(), Some(&bid));
+            b.reconnect().await.unwrap();
+            assert_eq!(b.selected_target_id.as_ref(), Some(&bid));
+            assert!(b
+                .evaluate("document.querySelector('#b').value")
+                .await
+                .unwrap()
+                .to_string()
+                .contains("downstream"));
+            // A owns the actual Chrome child. Disconnecting or dropping A must
+            // not kill that process while B still uses its independent task tab.
+            a.close().await.unwrap();
+            drop(a);
+            assert!(b.is_connection_alive().await);
+            assert!(b
+                .evaluate("document.querySelector('#b').value")
+                .await
+                .unwrap()
+                .to_string()
+                .contains("downstream"));
+            b.switch_tab_by_id(aid.as_ref(), false).await.unwrap();
+            assert!(b
+                .evaluate("document.querySelector('#a').value")
+                .await
+                .unwrap()
+                .to_string()
+                .contains("upstream"));
+            b.close().await.unwrap();
+        })
+        .catch_unwind()
+        .await;
+        // Only ever stop this test's unique profile, never the user's browser.
+        let _ = kill_chrome_for_profile(&profile).await;
+        cleanup_profile("cooperative_lifecycle");
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// Regression: after attaching to a running Chrome (a leftover/orphan instance, or a

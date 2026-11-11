@@ -9,13 +9,14 @@
 
 mod chrome_finder;
 mod client;
+pub mod coordination;
 mod shared;
 
 pub mod cookie_source;
 
 pub use chrome_finder::{find_chrome, ChromeError};
 pub use client::{BrowserClient, BrowserError, ExternalIdentity};
-pub use shared::{get_or_launch, runtime, shared_client, shutdown_browser};
+pub use shared::{get_or_launch, get_or_launch_isolated, runtime, shared_client, shutdown_browser};
 
 /// Round a byte index down to the nearest valid UTF-8 character boundary.
 ///

@@ -115,9 +115,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             writer.flush().await?;
             let code = server.exit_code();
             tracing::info!("[nuphus-mcp] exit notification received, exiting (code={code})");
-            // Explicit browser shutdown: the shared client lives in a `static` and is never
-            // dropped on exit, so without this a launched Chrome would be orphaned, holding
-            // the profile lock and destabilizing the next session (see shared::shutdown_browser).
+            // Release this session's tab claim and CDP connection. Cooperative
+            // browser clients leave shared Chrome alive for other sessions.
             shutdown_browser().await;
             std::process::exit(code as i32);
         }

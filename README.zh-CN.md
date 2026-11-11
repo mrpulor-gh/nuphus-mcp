@@ -328,3 +328,4 @@ cargo test -p nuphus-mcp          # 协议 + 安全 + 视觉 + 模型测试（28
 ## License
 
 MIT
+浏览器多任务并行：参见[标签页占用、桌面互斥与升级要求](docs/parallel-tabs.md)。
