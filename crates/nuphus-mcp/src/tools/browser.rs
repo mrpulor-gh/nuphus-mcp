@@ -150,13 +150,13 @@ pub async fn execute(name: &str, args: &Value) -> Result<String, String> {
             // Connection has its own bound. Once dispatch starts, the sequence
             // owns the deadline and returns its completed-step journal on expiry.
             let connection_deadline = tokio::time::Instant::now() + Duration::from_secs(25);
-            let mut guard =
-                tokio::time::timeout_at(connection_deadline, nuphus_browser::get_or_launch(false))
-                    .await
-                    .map_err(|_| {
-                        "Browser connection timed out before sequence dispatch".to_string()
-                    })?
-                    .map_err(|e| format!("browser launch failed before sequence dispatch: {e}"))?;
+            let mut guard = tokio::time::timeout_at(
+                connection_deadline,
+                nuphus_browser::get_or_launch_isolated(false),
+            )
+            .await
+            .map_err(|_| "Browser connection timed out before sequence dispatch".to_string())?
+            .map_err(|e| format!("browser launch failed before sequence dispatch: {e}"))?;
             let client = guard
                 .as_mut()
                 .ok_or_else(|| "browser client unavailable before sequence dispatch".to_string())?;
@@ -202,7 +202,7 @@ pub async fn execute(name: &str, args: &Value) -> Result<String, String> {
 /// into a string of user-visible errors.
 async fn run_tool(name: &str, args: &Value, timeout_secs: u64) -> Result<String, String> {
     // MCP scenarios use a visible browser window (same as the main crate's browser_tools)
-    let mut guard = nuphus_browser::get_or_launch(false)
+    let mut guard = nuphus_browser::get_or_launch_isolated(false)
         .await
         .map_err(|e| format!("browser launch failed: {e}"))?;
     let client = guard
@@ -386,6 +386,12 @@ async fn run_op(
     name: &str,
     args: &Value,
 ) -> Result<String, BrowserError> {
+    client.prepare_shared_settings().await?;
+    let identity = client.browser_identity().ok_or(BrowserError::NotStarted)?;
+    let exclusive = matches!(name, "browser_cookies_set" | "browser_import_cookies");
+    let _browser_guard = crate::automation_lock::coordination()
+        .browser(identity, exclusive)
+        .map_err(BrowserError::Execution)?;
     let output: String = match name {
         "browser_navigate" => {
             let url = args.get("url").and_then(Value::as_str).unwrap_or("");
@@ -543,7 +549,7 @@ async fn run_op(
         }
         "browser_close" => {
             client.close().await?;
-            "Browser closed".to_string()
+            "Browser session disconnected; tab claim released. Shared Chrome and its tabs remain open.".to_string()
         }
         "browser_cookies_get" => {
             let cookies = client.cookies_get().await?;
@@ -642,12 +648,26 @@ async fn run_op(
             serde_json::to_string_pretty(&tabs).unwrap_or_default()
         }
         "browser_switch_tab" => {
-            let index = args.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
             let activate = args
                 .get("activate")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            client.switch_tab_with_options(index, activate).await?
+            match (args.get("target_id"), args.get("index")) {
+                (Some(Value::String(id)), None) if !id.is_empty() => {
+                    client.switch_tab_by_id(id, activate).await?
+                }
+                (None, Some(value)) if value.as_u64().is_some() => {
+                    let index = usize::try_from(value.as_u64().unwrap())
+                        .map_err(|_| BrowserError::Execution("Tab index too large".into()))?;
+                    client.switch_tab_with_options(index, activate).await?
+                }
+                _ => {
+                    return Err(BrowserError::Execution(
+                        "Provide exactly one of target_id (preferred) or a non-negative index"
+                            .into(),
+                    ))
+                }
+            }
         }
         _ => {
             return Err(BrowserError::Execution(format!(

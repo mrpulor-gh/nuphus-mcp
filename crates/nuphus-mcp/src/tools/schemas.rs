@@ -520,7 +520,7 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "browser_close",
-            "Close browser and free resources.",
+            "Disconnect this session and release its tab claim. Shared Chrome and tabs remain open.",
             json!({}),
             &[],
         ),
@@ -616,18 +616,19 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "browser_list_tabs",
-            "List open tabs with indices, URLs, titles, stable target IDs, and selected (the task target, not UI focus). List again before switching because indices may change.",
+            "List open tabs with stable target_id, selected and available. Prefer target_id for switching; available=false means another session owns the tab.",
             json!({}),
             &[],
         ),
         tool_def(
             "browser_switch_tab",
-            "Select the task tab by index without changing foreground focus. Subsequent browser tools reuse this tab. Set activate=true only when foreground interaction is necessary.",
+            "Claim a task tab by target_id (preferred) or index without changing foreground focus. Other sessions cannot use it until you switch or disconnect. Provide exactly one selector. Set activate=true only for foreground interaction.",
             json_props! {
-                "index" => obj!("type"="integer","description"="Tab index from list_tabs"),
+                "target_id" => obj!("type"="string","minLength"=1,"description"="Stable target_id from list_tabs (preferred; provide this or index)"),
+                "index" => obj!("type"="integer","minimum"=0,"description"="Tab index from list_tabs; may change when tabs open/close"),
                 "activate" => obj!("type"="boolean","default"=false,"description"="Bring the selected tab to the foreground only when explicitly needed")
             },
-            &["index"],
+            &[],
         ),
     ]
 }

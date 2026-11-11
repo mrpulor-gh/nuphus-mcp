@@ -90,6 +90,18 @@ jobs:
         # would collide on SingletonLock.
         run: cargo test -p nuphus-browser -- --ignored --test-threads=1
 
+      - name: Build MCP for cross-process browser regression
+        run: cargo build -p nuphus-mcp
+      - name: Parallel MCP sessions (isolated headless Chrome)
+        shell: pwsh
+        run: |
+          $chrome = @(
+            "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+            "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $chrome) { throw "Chrome not found" }
+          python scripts/test_parallel_mcp.py --binary target/debug/nuphus-mcp.exe --chrome "$chrome"
+
   audit:
     name: cargo audit (advisory)
     runs-on: ubuntu-latest

@@ -40,16 +40,16 @@ impl ToolOutput {
 
 /// Execute a tool by name. Unknown tool names return Err (→ JSON-RPC -32602).
 ///
-/// Automation safety: desktop and browser automation operate on exclusive machine
-/// resources (mouse/keyboard/screen/browser). Only one Agent may run an automation
-/// operation at any moment:
-/// - **Process-level**: a process-wide tokio Mutex serializes all automation calls
-///   within this server instance (a stdio loop is sequential anyway; this also makes
-///   parallel test execution deterministic).
-/// - **Cross-process**: a file lock coordinates multiple MCP server instances (one
-///   per Agent via stdio) through `{data_dir}/Nuphus/nuphus-mcp/automation.lock`.
-/// The lock is held only for the duration of this call (short hold), released on return.
+/// Different MCP processes may operate separate task tabs concurrently. Desktop
+/// and explicit foreground operations acquire the machine gate exclusively.
+/// Within one session, preserve sequential command/ref/target state.
 pub async fn execute(name: &str, args: &serde_json::Value) -> Result<ToolOutput, String> {
+    let known = has_tool(name);
+    #[cfg(test)]
+    let known = known || name == "test_panic_tool";
+    if !known {
+        return Err(format!("Unknown tool: {name}"));
+    }
     // Process-level mutual exclusion: serialize automation operations within this
     // process. Held across the await points of the actual tool call.
     // Bounded: this lock sits *outside* every per-tool budget, so an unbounded
@@ -73,11 +73,10 @@ pub async fn execute(name: &str, args: &serde_json::Value) -> Result<ToolOutput,
         }
     };
 
-    // Cross-process lock: full coverage for every desktop_*/browser_* tool.
-    // Read-only operations (e.g. desktop_screen_size) also acquire it — they still
-    // touch the shared machine state and must not interleave with a writer's sequence.
+    // Shared machine access for background browser operations, exclusive access
+    // for desktop / foreground operations. Tab ownership lives in BrowserClient.
     let lock = crate::automation_lock::AutomationLock::new();
-    let file_guard = match lock.acquire(name) {
+    let file_guard = match lock.acquire(name, args) {
         Ok(guard) => guard,
         Err(e) => return Ok(ToolOutput::failure(e)),
     };

@@ -408,3 +408,4 @@ Thanks to the people who have contributed code to this project:
 ## License
 
 MIT
+Parallel browser tasks: see [tab ownership, desktop exclusion and upgrade requirements](docs/parallel-tabs.md).
