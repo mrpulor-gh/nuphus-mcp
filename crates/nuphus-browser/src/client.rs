@@ -6,6 +6,7 @@
 //! - Login state persistence (--user-data-dir)
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::dom::GetContentQuadsParams;
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, CaptureScreenshotParams, Viewport as ScreenshotViewport,
 };
@@ -2104,9 +2105,12 @@ impl BrowserClient {
                 r#"
             (function() {{
                 {scope_prefix}
-                const elements = root.querySelectorAll('a, button, input, textarea, select, [onclick]');
+                const elements = document.querySelectorAll('a, button, input, textarea, select, [onclick]');
                 const results = [];
                 elements.forEach((el, i) => {{
+                    // Preserve the global index used by legacy click/type/center.
+                    // Element.querySelectorAll excludes the scope root itself.
+                    if (root !== document && (el === root || !root.contains(el))) return;
                     const tag = el.tagName.toLowerCase();
                     const text = el.textContent?.trim().substring(0, 60) || '';
                     const type = el.type || '';
@@ -2130,9 +2134,12 @@ impl BrowserClient {
                 r#"
             (function() {{
                 {scope_prefix}
-                const elements = root.querySelectorAll('a, button, input, textarea, select, [onclick]');
+                const elements = document.querySelectorAll('a, button, input, textarea, select, [onclick]');
                 const results = [];
                 elements.forEach((el, i) => {{
+                    // Preserve the global index used by legacy click/type/center.
+                    // Element.querySelectorAll excludes the scope root itself.
+                    if (root !== document && (el === root || !root.contains(el))) return;
                     // Skip hidden / non-visible elements
                     const rect = el.getBoundingClientRect();
                     const style = window.getComputedStyle(el);
@@ -2261,7 +2268,7 @@ impl BrowserClient {
         let (x, y) = self.element_center(&page_guard, selector).await?;
 
         cdp_ctx(
-            "trusted click: mouseMoved failed",
+            &format!("trusted click: mouseMoved at ({x}, {y}) failed"),
             page_guard.execute(DispatchMouseEventParams::new(
                 DispatchMouseEventType::MouseMoved,
                 x,
@@ -2341,16 +2348,33 @@ impl BrowserClient {
                         desc
                     )));
                 }
-                resp.result
-                    .pointer("/result/value")
-                    .and_then(|v| v.as_str())
+                // getBoundingClientRect above is relative to the owning frame.
+                // Input.dispatchMouseEvent needs the main viewport coordinates;
+                // CDP content quads account for iframe offsets and transforms.
+                let quads = cdp_ctx(
+                    "element_center: content quads failed",
+                    page.execute(
+                        GetContentQuadsParams::builder()
+                            .object_id(object_id)
+                            .build(),
+                    ),
+                )
+                .await?;
+                let quad = quads
+                    .result
+                    .quads
+                    .first()
+                    .map(|q| q.inner())
+                    .filter(|q| q.len() == 8)
                     .ok_or_else(|| {
                         BrowserError::Execution(format!(
-                            "element_center: no coordinates returned for {}",
+                            "element_center: no visible content quad for {}",
                             selector
                         ))
-                    })?
-                    .to_string()
+                    })?;
+                let x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4.0;
+                let y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4.0;
+                format!("{},{}", x, y)
             } else if let Some(idx_str) = rest.strip_prefix('e') {
                 // Legacy @eN ref path (rest = "e5" after stripping '@')
                 let idx: usize = idx_str.parse().map_err(|_| {
