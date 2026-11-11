@@ -150,13 +150,13 @@ pub async fn execute(name: &str, args: &Value) -> Result<String, String> {
             // Connection has its own bound. Once dispatch starts, the sequence
             // owns the deadline and returns its completed-step journal on expiry.
             let connection_deadline = tokio::time::Instant::now() + Duration::from_secs(25);
-            let mut guard =
-                tokio::time::timeout_at(connection_deadline, nuphus_browser::get_or_launch_isolated(false))
-                    .await
-                    .map_err(|_| {
-                        "Browser connection timed out before sequence dispatch".to_string()
-                    })?
-                    .map_err(|e| format!("browser launch failed before sequence dispatch: {e}"))?;
+            let mut guard = tokio::time::timeout_at(
+                connection_deadline,
+                nuphus_browser::get_or_launch_isolated(false),
+            )
+            .await
+            .map_err(|_| "Browser connection timed out before sequence dispatch".to_string())?
+            .map_err(|e| format!("browser launch failed before sequence dispatch: {e}"))?;
             let client = guard
                 .as_mut()
                 .ok_or_else(|| "browser client unavailable before sequence dispatch".to_string())?;
