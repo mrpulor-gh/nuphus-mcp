@@ -116,10 +116,8 @@ fn host_is_private(host: &str) -> bool {
     false
 }
 
-/// Post-action effect-verification window (ms) for write operations that can
-/// silently no-op (click/type). A change detected within this window means the
-/// action took effect; an unchanged page means it very likely did not.
-/// Default 15s; `NUPHUS_MCP_EFFECT_TIMEOUT_MS=0` disables the check entirely.
+/// Optional page-reaction observation window for clicks. This is not proof of
+/// target delivery or application success, particularly in iframes/canvas UIs.
 fn effect_timeout_ms() -> u64 {
     std::env::var("NUPHUS_MCP_EFFECT_TIMEOUT_MS")
         .ok()
@@ -323,13 +321,13 @@ async fn run_op(
                     "browser_click: unsupported button '{button}' (expected left, right, or middle)"
                 )));
             }
-            // Effect verification: arm the change detector before dispatching,
-            // then wait a window for the page to react. A click that changes
-            // nothing within the window very likely did not take effect (dead
-            // button / covered element / wrong selector) — surface it instead of
-            // letting the next step proceed on a false "clicked" premise.
             let effect_timeout = effect_timeout_ms();
-            let verify_effect = button == "left" && effect_timeout > 0;
+            let verify_effect = args
+                .get("observe_change")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && button == "left"
+                && effect_timeout > 0;
             if verify_effect {
                 client.arm_change_detector().await?;
             }
@@ -338,14 +336,9 @@ async fn run_op(
             } else {
                 client.click(selector).await?
             };
+            let mut result = format!("{}\nClick dispatched; verify the intended UI state before proceeding. Dispatch alone does not prove the requested application action completed.", result);
             if verify_effect && !client.wait_for_change(effect_timeout).await? {
-                return Err(BrowserError::Execution(format!(
-                    "Click on '{}' executed but no DOM change was detected within {}ms — the click \
-                     likely did not take effect (dead/covered element, wrong selector, or an \
-                     effect that doesn't mutate this page such as opening a new tab). Verify the \
-                     page state with browser_snapshot / browser_list_tabs before the next step.",
-                    selector, effect_timeout
-                )));
+                result.push_str(&format!("\nNo top-level page change observed within {}ms. This does not determine whether a nested frame, canvas or new tab reacted. Inspect the actual target before retrying.", effect_timeout));
             }
             let include_snapshot = args
                 .get("snapshot")
