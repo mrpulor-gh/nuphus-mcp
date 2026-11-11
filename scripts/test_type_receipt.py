@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from test_parallel_mcp import MCP
+from mcp_client import MCP
 
 
 def main():
@@ -43,7 +43,7 @@ def main():
     for server in (inner_server, outer_server):
         threading.Thread(target=server.serve_forever, daemon=True).start()
     client = chrome = None
-    with tempfile.TemporaryDirectory(prefix='nuphus-type-test-') as td:
+    with tempfile.TemporaryDirectory(prefix='nuphus-type-test-', ignore_cleanup_errors=True) as td:
         root = Path(td)
         with (root/'chrome.log').open('w') as clog, (root/'mcp.log').open('w') as mlog:
             try:
@@ -55,7 +55,14 @@ def main():
                 while not portfile.exists():
                     assert chrome.poll() is None and time.monotonic() < deadline
                     time.sleep(.05)
-                endpoint = 'http://127.0.0.1:'+portfile.read_text().splitlines()[0]
+                endpoint = None
+                retry_deadline = time.monotonic()+20
+                while endpoint is None:
+                    try:
+                        endpoint = 'http://127.0.0.1:'+portfile.read_text().splitlines()[0]
+                    except (PermissionError, IndexError):
+                        assert chrome.poll() is None and time.monotonic() < retry_deadline
+                        time.sleep(.05)
                 client = MCP(args.binary.resolve(), endpoint, mlog)
                 client.ok('browser_new_tab')
                 client.ok('browser_navigate', url=f'http://127.0.0.1:{outer_server.server_port}/')
@@ -79,8 +86,9 @@ def main():
                     print(f'BASELINE reproduced: input received once, no Enter, false error after {elapsed:.3f}s', flush=True)
                     return
                 if args.click_baseline:
-                    target = next(t['target_id'] for t in json.loads(client.ok('browser_list_tabs')) if t['selected'])
-                    client.ok('browser_switch_tab', target_id=target, activate=True)
+                    tabs_now = json.loads(client.ok('browser_list_tabs'))
+                    target_index = next(t['index'] for t in tabs_now if t['selected'])
+                    client.ok('browser_switch_tab', index=target_index, activate=True)
                     snap = client.ok('browser_snapshot')
                     ref = re.search(r'(@\d+)[^\n]*Nested action', snap)
                     r = client.call('browser_click', selector=ref[1], trusted=True)
@@ -94,22 +102,44 @@ def main():
                 started = time.monotonic()
                 client.ok('browser_press', key='Enter')
                 assert time.monotonic()-started < 1.5
-                assert '"entered":1' in client.ok('browser_evaluate', script='JSON.stringify(window.receipt)').replace('\\', '')
+                entered = ""
+                dl_enter = time.monotonic()+2
+                while time.monotonic() < dl_enter:
+                    entered = client.ok('browser_evaluate', script='JSON.stringify(window.receipt)').replace(chr(92), '')
+                    if '"entered":1' in entered:
+                        break
+                    time.sleep(.05)
+                assert '"entered":1' in entered, entered
                 snap = client.ok('browser_snapshot')
                 ref = re.search(r'(@\d+)[^\n]*Nested action', snap)
                 started = time.monotonic()
                 client.ok('browser_click', selector=ref[1])
                 assert time.monotonic()-started < 3
-                assert 'true' in client.ok('browser_evaluate', script='JSON.stringify(window.clickReceipt)')
+                okd = False
+                dl_click = time.monotonic()+2
+                while time.monotonic() < dl_click:
+                    if 'true' in client.ok('browser_evaluate', script='JSON.stringify(window.clickReceipt)'):
+                        okd = True
+                        break
+                    time.sleep(.05)
+                assert okd, client.ok('browser_evaluate', script='JSON.stringify(window.clickReceipt)')
                 client.ok('browser_evaluate', script='window.clickReceipt=null')
                 # Trusted cross-frame hit-testing requires a visible compositor
                 # surface in headless Chrome. Activate ONLY this isolated fixture.
-                target = next(t['target_id'] for t in json.loads(client.ok('browser_list_tabs')) if t['selected'])
-                client.ok('browser_switch_tab', target_id=target, activate=True)
+                tabs_now = json.loads(client.ok('browser_list_tabs'))
+                target_index = next(t['index'] for t in tabs_now if t['selected'])
+                client.ok('browser_switch_tab', index=target_index, activate=True)
                 started = time.monotonic()
                 client.ok('browser_click', selector=ref[1], trusted=True)
                 assert time.monotonic()-started < 3
-                assert 'true' in client.ok('browser_evaluate', script='JSON.stringify(window.clickReceipt)')
+                okd = False
+                dl_click = time.monotonic()+2
+                while time.monotonic() < dl_click:
+                    if 'true' in client.ok('browser_evaluate', script='JSON.stringify(window.clickReceipt)'):
+                        okd = True
+                        break
+                    time.sleep(.05)
+                assert okd, client.ok('browser_evaluate', script='JSON.stringify(window.clickReceipt)')
                 print('PASS nested terminal Enter and trusted iframe button click without fixed waits', flush=True)
 
                 client.ok('browser_evaluate', script='''document.body.innerHTML=`

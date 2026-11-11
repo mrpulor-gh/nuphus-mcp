@@ -115,3 +115,58 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --check
+
+  # Guards the idempotency rules the release job depends on: "already published"
+  # must be verified against the registry (never inferred from an error string —
+  # the 0.1.5 ghost publish) and never faked when the version is absent
+  # (the 0.3.4 failure mode). Seconds to run, no network.
+  release-scripts:
+    name: npm publish helper (node --test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Unit tests for scripts/publish-npm-packages.js
+        run: node --test scripts/tests/publish-npm-packages.test.js
+  # dom_read.js is embedded into browser_exec's `read` step at compile time;
+  # this suite pins its match-before-truncate and completion-receipt semantics.
+  # Pure Node, no browser, seconds to run.
+  dom-read:
+    name: dom_read node tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: dom_read.js unit tests
+        run: node --test crates/nuphus-mcp/tests/dom_read.cjs
+
+  # End-to-end proof that browser_type reports delivery from the target's own
+  # frame (cross-origin iframe terminal), and that trusted clicks land inside
+  # frames. Real headless Chrome with an isolated profile; windows-latest ships
+  # Chrome preinstalled. continue-on-error for the initial rollout, same policy
+  # as browser-integration.
+  mcp-type-receipt:
+    name: browser_type receipt e2e (windows)
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ runner.arch }}
+      - name: Build nuphus-mcp
+        run: cargo build -p nuphus-mcp
+      - name: Type receipt e2e (isolated headless Chrome)
+        shell: pwsh
+        run: |
+          $chrome = @(
+            "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+            "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $chrome) { throw "Chrome not found" }
+          python scripts/test_type_receipt.py --binary target/debug/nuphus-mcp.exe --chrome "$chrome"
