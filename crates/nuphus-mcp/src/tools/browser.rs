@@ -365,20 +365,22 @@ async fn run_op(
         "browser_type" => {
             let selector = selector_or_ref("browser_type", args)?;
             let text = args.get("text").and_then(Value::as_str).unwrap_or("");
-            // Effect verification (same contract as click): arm before typing,
-            // then confirm the field actually received the text within the window.
-            let effect_timeout = effect_timeout_ms();
-            if effect_timeout > 0 {
-                client.arm_change_detector().await?;
-            }
-            let result = client.type_text(selector, text).await?;
-            if effect_timeout > 0 && !client.wait_for_change(effect_timeout).await? {
-                return Err(BrowserError::Execution(format!(
-                    "Typed into '{}' but no change was detected within {}ms — the input likely did \
-                     not accept the text (covered/read-only element, wrong selector, or a locked \
-                     page). Verify the field value with browser_snapshot before the next step.",
-                    selector, effect_timeout
-                )));
+            let clear = args.get("clear").and_then(Value::as_bool).unwrap_or(true);
+            let result = match args.get("mode").and_then(Value::as_str).unwrap_or("insert") {
+                "insert" => client.type_text_with_options(selector, text, clear).await?,
+                "paste" => client.paste_text_at_ref(selector, text).await?,
+                _ => {
+                    return Err(BrowserError::Execution(
+                        "type mode must be insert or paste".into(),
+                    ))
+                }
+            };
+            if !args
+                .get("snapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+            {
+                return Ok(result);
             }
             match client.snapshot(false, None).await {
                 Ok(snap) => format!("{}\n\n── Page state ──\n{}", result, snap),
@@ -465,7 +467,11 @@ async fn run_op(
         }
         "browser_evaluate" => {
             let script = args.get("script").and_then(Value::as_str).unwrap_or("");
-            client.evaluate(script).await.map(|v| v.to_string())?
+            if let Some(reference) = args.get("ref").and_then(Value::as_str) {
+                client.evaluate_at_ref(script, reference).await?.to_string()
+            } else {
+                client.evaluate(script).await?.to_string()
+            }
         }
         "browser_back" => client.back().await?,
         "browser_forward" => client.forward().await?,
