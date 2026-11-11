@@ -314,7 +314,9 @@ mod tests {
 
     fn error_of(resp: &str) -> (i32, String) {
         let v = parse(resp);
-        let err = v.get("error").expect("response must have error");
+        let err = v
+            .get("error")
+            .unwrap_or_else(|| panic!("response must have error: {resp}"));
         (
             err.get("code").and_then(Value::as_i64).unwrap_or(0) as i32,
             err.get("message")
@@ -525,7 +527,8 @@ mod tests {
         assert_eq!(content["type"], "text");
         let text = content["text"].as_str().expect("text must be string");
         // Text should be {"width":N,"height":M}
-        let parsed: Value = serde_json::from_str(text).expect("result must be JSON");
+        let parsed: Value = serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("result must be JSON: {e}; response={resp}"));
         assert!(parsed["width"].as_u64().unwrap_or(0) > 0);
         assert!(parsed["height"].as_u64().unwrap_or(0) > 0);
     }

@@ -1081,7 +1081,7 @@ return an explanatory error.
 ### browser_upload
 
 Upload a file to a file input element using the DataTransfer trick. The file
-must exist on disk.
+must exist on disk. An AX `@N` resolves its actual backend node in its owning frame. The target must be a connected `input[type=file]`; the assigned filename and byte length are verified before reporting success. This confirms input assignment, not a server-side upload.
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
@@ -1117,7 +1117,7 @@ not subject to the MCP request-line size limit.
 
 ### browser_list_downloads
 
-List files in the browser download directory.
+List files in the browser download directory. Directory, entry and metadata read errors are returned as errors rather than an empty list or a zero-byte file. A listed file still needs task-specific completeness and digest checks.
 
 | Name | Type | Required | Default | Description |
 |------|------|----------|---------|-------------|
