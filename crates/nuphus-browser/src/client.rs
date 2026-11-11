@@ -380,6 +380,39 @@ impl Command for InputInsertText {
     type Response = serde_json::Value;
 }
 
+/// Native file-only drag payload. The generated CDP type omits empty items;
+/// preserve it explicitly rather than adding a text item (getAsFile() is null).
+#[derive(Debug, Clone, Serialize)]
+struct InputFileDrag {
+    #[serde(rename = "type")]
+    event_type: String,
+    x: f64,
+    y: f64,
+    data: serde_json::Value,
+}
+impl Method for InputFileDrag {
+    fn identifier(&self) -> Cow<'static, str> {
+        "Input.dispatchDragEvent".into()
+    }
+}
+impl Command for InputFileDrag {
+    type Response = serde_json::Value;
+}
+
+#[cfg(test)]
+mod file_drag_payload_tests {
+    use super::InputFileDrag;
+    #[test]
+    fn native_file_drag_keeps_empty_items_without_null_file_placeholder() {
+        let value = serde_json::to_value(InputFileDrag {
+            event_type:"drop".into(), x:1.0, y:2.0,
+            data:serde_json::json!({"items":[],"files":["/test/example.txt"],"dragOperationsMask":1}),
+        }).unwrap();
+        assert_eq!(value["data"]["items"], serde_json::json!([]));
+        assert_eq!(value["data"]["files"][0], "/test/example.txt");
+    }
+}
+
 /// CDP `DOM.enable` — enables DOM agent for querySelector/resolveNode/describeNode.
 #[derive(Debug, Clone, Serialize, Default)]
 struct DOMEnable {}
@@ -3031,8 +3064,8 @@ impl BrowserClient {
 
     /// Configure Chrome download behavior via CDP `Browser.setDownloadBehavior`.
     async fn configure_download_dir(&mut self) -> Result<(), BrowserError> {
-        let page = self.get_page().await?;
-        let page_guard = page.lock().await;
+        let browser = self.browser.as_ref().ok_or(BrowserError::NotStarted)?;
+        let browser_guard = browser.lock().await;
 
         // Ensure download directory exists
         let _ = std::fs::create_dir_all(&self.download_dir);
@@ -3044,7 +3077,7 @@ impl BrowserClient {
             events_enabled: Some(true),
         };
 
-        match cdp(page_guard.execute(cmd)).await {
+        match cdp(browser_guard.execute(cmd)).await {
             Ok(_) => {
                 tracing::info!("[Browser] Download dir set to: {}", download_path);
                 self.download_configured = true;
@@ -3069,21 +3102,26 @@ impl BrowserClient {
     /// List files in the download directory.
     pub fn list_downloads(&self) -> Result<String, BrowserError> {
         let mut files = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.download_dir) {
-            for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() {
-                        files.push(serde_json::json!({
-                            "name": entry.file_name().to_string_lossy(),
-                            "path": entry.path().to_string_lossy(),
-                            "size": meta.len(),
-                            "modified": meta.modified().ok().map(|t| {
-                                chrono::DateTime::<chrono::Utc>::from(t)
-                                    .format("%Y-%m-%d %H:%M:%S").to_string()
-                            }),
-                        }));
-                    }
-                }
+        let entries = std::fs::read_dir(&self.download_dir).map_err(|error| {
+            BrowserError::Execution(format!(
+                "Failed to list download directory '{}': {}",
+                self.download_dir.display(),
+                error
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(BrowserError::Io)?;
+            let meta = entry.metadata().map_err(BrowserError::Io)?;
+            if meta.is_file() {
+                files.push(serde_json::json!({
+                    "name": entry.file_name().to_string_lossy(),
+                    "path": entry.path().to_string_lossy(),
+                    "size": meta.len(),
+                    "modified": meta.modified().ok().map(|t| {
+                        chrono::DateTime::<chrono::Utc>::from(t)
+                            .format("%Y-%m-%d %H:%M:%S").to_string()
+                    }),
+                }));
             }
         }
         if let Some(warning) = &self.download_config_warning {
@@ -3158,87 +3196,97 @@ impl BrowserClient {
         ))
     }
 
-    /// Upload a file to a file input element using the DataTransfer trick.
-    ///
-    /// Reads the file from disk, base64-encodes it, creates a File object in JS,
-    /// and sets it on the target `<input type="file">` element.
+    /// Upload a file to the exact CSS element or current AX snapshot ref.
+    /// This confirms the input's file metadata, not server-side upload completion.
     pub async fn upload_file(
         &self,
         selector: &str,
         file_path: &str,
     ) -> Result<String, BrowserError> {
+        use base64::Engine;
+        let path = std::path::Path::new(file_path);
+        let metadata = std::fs::metadata(path)?;
+        if !metadata.is_file() {
+            return Err(BrowserError::Execution(format!(
+                "Upload path is not a regular file: {}",
+                path.display()
+            )));
+        }
+        let bytes = std::fs::read(path)?;
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        let mime_type = mime_guess::from_path(file_path).first_or_octet_stream();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let selector_lit = js_string_literal(selector);
+        let name_lit = js_string_literal(file_name);
+        let mime_lit = js_string_literal(mime_type.as_ref());
+
         let page = self.get_page().await?;
         let page_guard = page.lock().await;
-
-        // Read file from disk
-        let path = std::path::Path::new(file_path);
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file")
-            .to_string();
-
-        let data = std::fs::read(path).map_err(BrowserError::Io)?;
-
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-
-        let mime = mime_guess::from_path(path)
-            .first_or_octet_stream()
-            .to_string();
-
-        // JS string literals via serde_json — safe against quotes/backslashes in
-        // the selector or file name (ad-hoc ' escaping was both incomplete and
-        // inconsistent with the rest of the codebase).
-        let selector_lit = js_string_literal(selector);
-        let name_lit = js_string_literal(&file_name);
-        let mime_lit = js_string_literal(&mime);
-
-        let js = format!(
-            r#"(function() {{
-    // Find the file input element
-    let el;
-    const sel = {selector_lit};
-    if (sel.startsWith('@')) {{
-        const idx = parseInt(sel.slice(1)) - 1;
-        const els = document.querySelectorAll('input[type="file"]');
-        if (!els[idx]) throw new Error('File input ' + sel + ' not found');
-        el = els[idx];
-    }} else {{
-        el = document.querySelector(sel);
-        if (!el) throw new Error('File input ' + sel + ' not found');
-    }}
-
-    // Decode base64 to Uint8Array
-    const b64 = '{b64}';
-    const byteChars = atob(b64);
-    const byteArr = new Uint8Array(byteChars.length);
-    for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i);
-
-    // Create File object
-    const file = new File([byteArr], {name_lit}, {{ type: {mime_lit} }});
-
-    // Set via DataTransfer
-    const dt = new DataTransfer();
-    dt.items.add(file);
-    el.files = dt.files;
-    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-
-    return 'Uploaded ' + {name_lit} + ' (' + byteArr.length + ' bytes) to ' + sel;
-}})()"#,
+        let object_id = if let Some(digits) = selector.strip_prefix('@') {
+            let idx = digits.parse::<usize>().map_err(|_| {
+                BrowserError::Execution("Upload ref must be a current @N snapshot ref".into())
+            })?;
+            let (backend_id, frame_label) = self.ax_ref(idx)?;
+            self.resolve_backend_node(&page_guard, backend_id, frame_label)
+                .await?
+        } else {
+            cdp(page_guard.find_element(selector))
+                .await?
+                .remote_object_id
+        };
+        let function_declaration = format!(
+            r#"function() {{
+                const input = this;
+                const selector = {selector_lit};
+                if (!input || input.tagName !== 'INPUT' || input.type !== 'file')
+                    throw new Error('Upload target is not input[type=file]: ' + selector);
+                if (!input.isConnected)
+                    throw new Error('Upload target is detached: ' + selector);
+                const binary = atob('{b64}');
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                const file = new File([bytes], {name_lit}, {{type: {mime_lit}}});
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                input.files = dt.files;
+                const assigned = input.files;
+                if (!assigned || assigned.length !== 1 || assigned[0].name !== file.name ||
+                    assigned[0].size !== file.size || assigned[0].type !== file.type)
+                    throw new Error('Upload file metadata was not accepted; inspect before retrying: ' + selector);
+                input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                return 'Uploaded ' + {name_lit} + ' (' + bytes.length + ' bytes) to ' + selector;
+            }}"#,
             selector_lit = selector_lit,
             b64 = b64,
             name_lit = name_lit,
-            mime_lit = mime_lit,
+            mime_lit = mime_lit
         );
-
-        let result = cdp(page_guard.evaluate(js)).await?;
-
-        let value: String = result
-            .into_value()
-            .unwrap_or_else(|_| "Upload completed".to_string());
-
-        Ok(value)
+        let response = cdp_ctx(
+            "File input assignment failed; inspect before retrying",
+            page_guard.execute(RuntimeCallFunctionOn {
+                function_declaration,
+                object_id: Some(object_id.inner().clone()),
+                return_by_value: Some(true),
+                await_promise: Some(true),
+            }),
+        )
+        .await?;
+        if let Some(details) = response.result.get("exceptionDetails") {
+            return Err(BrowserError::Execution(format!(
+                "File input assignment failed: {}",
+                details
+            )));
+        }
+        response
+            .result
+            .pointer("/result/value")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                BrowserError::Execution(
+                    "File input assignment result is unknown; inspect before retrying".into(),
+                )
+            })
     }
 
     /// Drag existing local files or directories onto an element using Chrome's
@@ -3249,10 +3297,6 @@ impl BrowserClient {
         selector: &str,
         file_paths: &[String],
     ) -> Result<String, BrowserError> {
-        use chromiumoxide::cdp::browser_protocol::input::{
-            DispatchDragEventParams, DispatchDragEventType, DragData, DragDataItem,
-        };
-
         if file_paths.is_empty() {
             return Err(BrowserError::Execution(
                 "drag_files requires at least one path".to_string(),
@@ -3262,23 +3306,18 @@ impl BrowserClient {
         let page = self.get_page().await?;
         let page_guard = page.lock().await;
         let (x, y) = self.element_center(&page_guard, selector).await?;
-
-        let drag_data = DragData::builder()
-            // Chromium requires the `items` field even for file-only drags; the
-            // generated CDP type omits an empty Vec during serialization.
-            .item(DragDataItem::new("text/plain", ""))
-            .files(file_paths.iter().cloned())
-            .drag_operations_mask(1)
-            .build()
-            .map_err(|e| BrowserError::Execution(format!("drag data build: {e}")))?;
-
-        for event_type in [
-            DispatchDragEventType::DragEnter,
-            DispatchDragEventType::DragOver,
-            DispatchDragEventType::Drop,
-        ] {
-            let event = DispatchDragEventParams::new(event_type, x, y, drag_data.clone());
-            cdp_ctx("file drag event failed", page_guard.execute(event)).await?;
+        let data = serde_json::json!({"items":[],"files":file_paths,"dragOperationsMask":1});
+        for event_type in ["dragEnter", "dragOver", "drop"] {
+            cdp_ctx(
+                "file drag event failed",
+                page_guard.execute(InputFileDrag {
+                    event_type: event_type.into(),
+                    x,
+                    y,
+                    data: data.clone(),
+                }),
+            )
+            .await?;
         }
 
         Ok(format!(
