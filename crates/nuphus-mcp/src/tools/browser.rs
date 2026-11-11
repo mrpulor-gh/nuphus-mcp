@@ -116,10 +116,8 @@ fn host_is_private(host: &str) -> bool {
     false
 }
 
-/// Post-action effect-verification window (ms) for write operations that can
-/// silently no-op (click/type). A change detected within this window means the
-/// action took effect; an unchanged page means it very likely did not.
-/// Default 15s; `NUPHUS_MCP_EFFECT_TIMEOUT_MS=0` disables the check entirely.
+/// Optional page-reaction observation window for clicks. This is not proof of
+/// target delivery or application success, particularly in iframes/canvas UIs.
 fn effect_timeout_ms() -> u64 {
     std::env::var("NUPHUS_MCP_EFFECT_TIMEOUT_MS")
         .ok()
@@ -145,13 +143,40 @@ fn selector_or_ref<'a>(tool: &str, args: &'a Value) -> Result<&'a str, BrowserEr
 
 /// Execute a browser_* tool, returning a text result.
 pub async fn execute(name: &str, args: &Value) -> Result<String, String> {
+    if name == "browser_exec" {
+        if let super::browser_sequence::Plan::Steps(steps) =
+            super::browser_sequence::plan(args).map_err(|e| e.to_string())?
+        {
+            // Connection has its own bound. Once dispatch starts, the sequence
+            // owns the deadline and returns its completed-step journal on expiry.
+            let connection_deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+            let mut guard =
+                tokio::time::timeout_at(connection_deadline, nuphus_browser::get_or_launch(false))
+                    .await
+                    .map_err(|_| {
+                        "Browser connection timed out before sequence dispatch".to_string()
+                    })?
+                    .map_err(|e| format!("browser launch failed before sequence dispatch: {e}"))?;
+            let client = guard
+                .as_mut()
+                .ok_or_else(|| "browser client unavailable before sequence dispatch".to_string())?;
+            return super::browser_sequence::execute(client, steps)
+                .await
+                .map_err(|e| e.to_string());
+        }
+    }
     // Per-operation budget (same policy as the main crate's browser_tools.rs).
     let timeout_secs: u64 = match name {
         "browser_navigate" | "browser_back" | "browser_forward" => 30,
         "browser_exec" => 15,
-        // click/type additionally wait the effect-verification window after the
-        // action, so budget = action timeout + that window.
-        "browser_click" | "browser_type" => 15 + effect_timeout_ms() / 1000,
+        "browser_click"
+            if args
+                .get("observe_change")
+                .and_then(Value::as_bool)
+                .unwrap_or(false) =>
+        {
+            15 + effect_timeout_ms() / 1000
+        }
         "browser_wait_for" => {
             args.get("timeout_ms")
                 .and_then(Value::as_u64)
@@ -278,6 +303,84 @@ async fn run_op_with_reconnect(
 
 /// Execute a single tool operation against the browser. Returns a connection-class error
 /// when the CDP link is dead; `run_op_with_reconnect` turns that into a reconnect + retry.
+#[cfg(test)]
+mod ui_sequence_tests {
+    use super::validate_ui_steps;
+    use serde_json::json;
+
+    #[test]
+    fn validates_whole_sequence_before_dispatch() {
+        assert!(validate_ui_steps(&[]).is_err());
+        assert!(validate_ui_steps(&[
+            json!({"op":"type","ref":"@1","text":"pwd"}),
+            json!({"op":"invalid"})
+        ])
+        .is_err());
+        assert!(validate_ui_steps(&[json!({"op":"press"})]).is_err());
+        assert!(validate_ui_steps(&[
+            json!({"op":"type","ref":"@1","text":"pwd","mode":"unknown"})
+        ])
+        .is_err());
+        assert!(validate_ui_steps(&[json!({"op":"read","ref":"@1","timeout_ms":8001})]).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_tail_before_any_write() {
+        let invalid_tails = [
+            json!({"op":"read","ref":"@1","timeout_ms":-1}),
+            json!({"op":"read","ref":"@1","timeout_ms":"100"}),
+            json!({"op":"read","ref":"@1","max_chars":0}),
+            json!({"op":"read","ref":"@1","max_chars":20001}),
+            json!({"op":"type","ref":"@1","text":"x","clear":"false"}),
+            json!({"op":"type","ref":"@1","text":"x","mode":false}),
+            json!({"op":"click","ref":"@1","trusted":"true"}),
+            json!({"op":"click","ref":"@0"}),
+            json!({"op":"click","ref":"@-1"}),
+            json!({"op":"read","ref":"#terminal"}),
+            json!({"op":"read","ref":"@1","selector":42}),
+            json!({"op":"press","key":"Enter","ref":"@1"}),
+            json!({"op":"snapshot","unexpected":true}),
+        ];
+        for tail in invalid_tails {
+            assert!(
+                validate_ui_steps(&[
+                    json!({"op":"type","ref":"@1","text":"must not be dispatched"}),
+                    tail.clone(),
+                ])
+                .is_err(),
+                "accepted invalid tail: {tail}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_can_only_finish_a_sequence() {
+        assert!(
+            validate_ui_steps(&[json!({"op":"snapshot"}), json!({"op":"click","ref":"@1"}),])
+                .is_err()
+        );
+        assert!(
+            validate_ui_steps(&[json!({"op":"click","ref":"@1"}), json!({"op":"snapshot"}),])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn accepts_bounded_terminal_sequence() {
+        assert!(validate_ui_steps(&[
+            json!({"op":"type","ref":"@1","text":"pwd","mode":"paste","clear":false}),
+            json!({"op":"press","key":"Enter"}),
+            json!({"op":"read","ref":"@1","until_text":"/work","timeout_ms":2000})
+        ])
+        .is_ok());
+    }
+}
+
+#[cfg(test)]
+fn validate_ui_steps(steps: &[Value]) -> Result<(), BrowserError> {
+    super::browser_sequence::validate_steps(steps)
+}
+
 async fn run_op(
     client: &mut BrowserClient,
     name: &str,
@@ -302,15 +405,12 @@ async fn run_op(
             let selector = args.get("selector").and_then(Value::as_str);
             client.snapshot(full, selector).await?
         }
-        "browser_exec" => {
-            let script = args.get("script").and_then(Value::as_str).unwrap_or("");
-            if script.is_empty() {
-                return Err(BrowserError::Execution(
-                    "browser_exec: script parameter is required".to_string(),
-                ));
+        "browser_exec" => match super::browser_sequence::plan(args)? {
+            super::browser_sequence::Plan::Steps(steps) => {
+                super::browser_sequence::execute(client, steps).await?
             }
-            client.batch_exec(script).await?
-        }
+            super::browser_sequence::Plan::Script(script) => client.batch_exec(script).await?,
+        },
         "browser_click" => {
             let selector = selector_or_ref("browser_click", args)?;
             let trusted = args
@@ -323,13 +423,13 @@ async fn run_op(
                     "browser_click: unsupported button '{button}' (expected left, right, or middle)"
                 )));
             }
-            // Effect verification: arm the change detector before dispatching,
-            // then wait a window for the page to react. A click that changes
-            // nothing within the window very likely did not take effect (dead
-            // button / covered element / wrong selector) — surface it instead of
-            // letting the next step proceed on a false "clicked" premise.
             let effect_timeout = effect_timeout_ms();
-            let verify_effect = button == "left" && effect_timeout > 0;
+            let verify_effect = args
+                .get("observe_change")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && button == "left"
+                && effect_timeout > 0;
             if verify_effect {
                 client.arm_change_detector().await?;
             }
@@ -338,14 +438,9 @@ async fn run_op(
             } else {
                 client.click(selector).await?
             };
+            let mut result = format!("{}\nClick dispatched; verify the intended UI state before proceeding. Dispatch alone does not prove the requested application action completed.", result);
             if verify_effect && !client.wait_for_change(effect_timeout).await? {
-                return Err(BrowserError::Execution(format!(
-                    "Click on '{}' executed but no DOM change was detected within {}ms — the click \
-                     likely did not take effect (dead/covered element, wrong selector, or an \
-                     effect that doesn't mutate this page such as opening a new tab). Verify the \
-                     page state with browser_snapshot / browser_list_tabs before the next step.",
-                    selector, effect_timeout
-                )));
+                result.push_str(&format!("\nNo top-level page change observed within {}ms. This does not determine whether a nested frame, canvas or new tab reacted. Inspect the actual target before retrying.", effect_timeout));
             }
             let include_snapshot = args
                 .get("snapshot")
@@ -365,20 +460,22 @@ async fn run_op(
         "browser_type" => {
             let selector = selector_or_ref("browser_type", args)?;
             let text = args.get("text").and_then(Value::as_str).unwrap_or("");
-            // Effect verification (same contract as click): arm before typing,
-            // then confirm the field actually received the text within the window.
-            let effect_timeout = effect_timeout_ms();
-            if effect_timeout > 0 {
-                client.arm_change_detector().await?;
-            }
-            let result = client.type_text(selector, text).await?;
-            if effect_timeout > 0 && !client.wait_for_change(effect_timeout).await? {
-                return Err(BrowserError::Execution(format!(
-                    "Typed into '{}' but no change was detected within {}ms — the input likely did \
-                     not accept the text (covered/read-only element, wrong selector, or a locked \
-                     page). Verify the field value with browser_snapshot before the next step.",
-                    selector, effect_timeout
-                )));
+            let clear = args.get("clear").and_then(Value::as_bool).unwrap_or(true);
+            let result = match args.get("mode").and_then(Value::as_str).unwrap_or("insert") {
+                "insert" => client.type_text_with_options(selector, text, clear).await?,
+                "paste" => client.paste_text_at_ref(selector, text).await?,
+                _ => {
+                    return Err(BrowserError::Execution(
+                        "type mode must be insert or paste".into(),
+                    ))
+                }
+            };
+            if !args
+                .get("snapshot")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+            {
+                return Ok(result);
             }
             match client.snapshot(false, None).await {
                 Ok(snap) => format!("{}\n\n── Page state ──\n{}", result, snap),
@@ -465,7 +562,11 @@ async fn run_op(
         }
         "browser_evaluate" => {
             let script = args.get("script").and_then(Value::as_str).unwrap_or("");
-            client.evaluate(script).await.map(|v| v.to_string())?
+            if let Some(reference) = args.get("ref").and_then(Value::as_str) {
+                client.evaluate_at_ref(script, reference).await?.to_string()
+            } else {
+                client.evaluate(script).await?.to_string()
+            }
         }
         "browser_back" => client.back().await?,
         "browser_forward" => client.forward().await?,

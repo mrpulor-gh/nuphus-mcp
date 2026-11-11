@@ -85,6 +85,54 @@ fn tool_def_with_selector_or_ref(
     tool
 }
 
+fn ui_step(op: &str, properties: Value, required: &[&str]) -> Value {
+    let mut properties = properties;
+    properties["op"] = json!({"type":"string","enum":[op]});
+    let mut required = required.to_vec();
+    required.push("op");
+    json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
+}
+
+fn browser_exec_tool() -> ToolDef {
+    let mut tool = tool_def(
+        "browser_exec",
+        "Run 1..12 UI steps using current snapshot @N refs across frames, or a legacy script. Steps are validated together before dispatch and share a 15s execution budget (connection setup is separately bounded). Stops on any failure without replay; returns completed steps even on timeout, with success/status and per-step elapsed_ms. Failed/unknown batches also set MCP isError. read matches full visible DOM before truncating its returned tail; completion_prefix waits for a newline-terminated shell exit receipt, returns exit_code and stops on nonzero. Missing completion is unknown, not permission to resubmit. snapshot may only be the final step. Legacy script/h helpers use top-document selectors and a separate ref list, not AX @N.",
+        json_props! {
+            "script" => obj!("type"="string","description"="Legacy JS batch; omit when using steps (an empty optional filler is also accepted)"),
+            "steps" => obj!("type"="array","minItems"=0,"maxItems"=12,"description"="Sequential UI actions; provide only fields of each selected op. Empty array is accepted only as a filler alongside legacy script","items"=json!({"oneOf":[
+                ui_step("type", json_props! {
+                    "ref" => obj!("type"="string","description"="Current editable snapshot @N"),
+                    "text" => obj!("type"="string"),
+                    "mode" => obj!("type"="string","enum"=["insert","paste"],"default"="insert"),
+                    "clear" => obj!("type"="boolean","default"=false,"description"="Only insert can clear; paste requires false")
+                }, &["ref","text"]),
+                ui_step("press", json_props! { "key" => obj!("type"="string") }, &["key"]),
+                ui_step("click", json_props! {
+                    "ref" => obj!("type"="string"), "trusted" => obj!("type"="boolean","default"=false)
+                }, &["ref"]),
+                ui_step("read", json_props! {
+                    "ref" => obj!("type"="string","description"="Current snapshot @N selecting the owning frame/terminal"),
+                    "selector" => obj!("type"="string","description"="DOM text selector; empty/omitted uses .xterm-accessibility-tree"),
+                    "until_text" => obj!("type"="string","description"="Optional substring to observe; leave empty when using completion_prefix"),
+                    "completion_prefix" => obj!("type"="string","description"="Optional unique shell receipt prefix ending in =, e.g. TASK_7f3a_RC=. Waits for an independent newline-terminated prefix + exit code 0..255. Returns exit_code; nonzero fails and stops the batch."),
+                    "timeout_ms" => obj!("type"="integer","minimum"=0,"maximum"=8000,"default"=0),
+                    "max_chars" => obj!("type"="integer","minimum"=1,"maximum"=20000,"default"=6000)
+                }, &["ref"]),
+                ui_step("evaluate", json_props! {
+                    "script" => obj!("type"="string"),
+                    "ref" => obj!("type"="string","description"="Optional current @N to use its owning frame; empty/omitted uses the top document")
+                }, &["script"]),
+                ui_step("snapshot", json!({}), &[])
+            ]}))
+        }, &[],
+    );
+    tool.input_schema["anyOf"] = json!([
+        {"required":["steps"],"properties":{"steps":{"minItems":1}}},
+        {"required":["script"],"properties":{"script":{"minLength":1}}}
+    ]);
+    tool
+}
+
 /// All tools (desktop + browser)
 pub fn all_tools() -> Vec<ToolDef> {
     let mut tools = desktop_tools();
@@ -409,33 +457,30 @@ fn browser_tools() -> Vec<ToolDef> {
             },
             &[],
         ),
-        tool_def(
-            "browser_exec",
-            "Run multi-step batch script in ONE CDP round trip (form filling, multi-click). Helpers: h.click('@N'|'selector'), h.fill(sel, text), h.scroll(px), h.wait(ms), h.extract(sel), h.snapshot(). Returns [{op, ref, success, detail}] per step.",
-            json_props! {
-                "script" => obj!("type"="string","description"="JS using window.__nuphus helpers (alias 'h')")
-            },
-            &["script"],
-        ),
+        browser_exec_tool(),
         tool_def_with_selector_or_ref(
             "browser_click",
-            "Click element by CSS selector or @N ref. Auto-waits for visibility (5s). Left clicks default to JS click (no user activation); trusted=true sends real CDP events. Right/middle clicks always trusted.",
+            "Dispatch click by CSS selector or @N ref. Auto-waits for CSS visibility (5s). Left clicks default to JS click; trusted=true sends real CDP events. Right/middle always trusted. Verify the intended UI outcome; no default DOM-change wait (iframe/canvas effects may be invisible to it).",
             json_props! {
                 "selector" => obj!("type"="string","minLength"=1,"description"="CSS selector or ref ID (e.g. @1, @e0, 'button')"),
                 "ref" => obj!("type"="string","minLength"=1,"description"="Ref ID from snapshot (e.g. @1, @e0); alias of selector — provide either one"),
                 "trusted" => obj!("type"="boolean","description"="Dispatch real trusted CDP mouse events at the element's center (produces user activation). Default false for left clicks; right and middle clicks are always trusted."),
                 "button" => obj!("type"="string","enum"=["left","right","middle"],"default"="left","description"="Mouse button. Right and middle clicks use trusted CDP events automatically."),
+                "observe_change" => obj!("type"="boolean","default"=false,"description"="Optionally observe top-level page changes after a left click. This cannot prove success/failure in iframe or canvas applications. Prefer checking the specific intended UI state."),
                 "snapshot" => obj!("type"="boolean","description"="Include a post-click page snapshot. Defaults to true for left clicks and false for right/middle clicks so transient context menus remain open for the next operation.")
             },
             &[],
         ),
         tool_def_with_selector_or_ref(
             "browser_type",
-            "Type text into input by CSS selector or @N ref. Auto-waits for visibility (5s).",
+            "Type text into an editable control by CSS selector or @N ref. Verifies input receipt in the target frame, including terminal textareas; receipt does not prove application processing or command execution. Auto-waits for CSS visibility (5s).",
             json_props! {
                 "selector" => obj!("type"="string","minLength"=1,"description"="CSS selector or ref ID of input field (e.g. @1, @e0)"),
                 "ref" => obj!("type"="string","minLength"=1,"description"="Ref ID from snapshot (e.g. @1, @e0); alias of selector — provide either one"),
-                "text" => obj!("type"="string","description"="Text to type")
+                "text" => obj!("type"="string","description"="Text to type"),
+                "clear" => obj!("type"="boolean","default"=true,"description"="Replace existing field content by default. Set false to preserve the current content/selection, especially for terminal input; this does not clear a terminal's shell buffer."),
+                "mode" => obj!("type"="string","enum"=["insert","paste"],"default"="insert","description"="insert uses native text insertion; paste dispatches a DOM paste to a current @N editable control without touching the system clipboard; it does not clear the shell buffer"),
+                "snapshot" => obj!("type"="boolean","default"=true,"description"="Set false when the next step reads a specific result, avoiding a full AX snapshot")
             },
             &["text"],
         ),
@@ -481,9 +526,10 @@ fn browser_tools() -> Vec<ToolDef> {
         ),
         tool_def(
             "browser_evaluate",
-            "Execute arbitrary JavaScript in the current page.",
+            "Execute JavaScript in the selected page, or in the owning DOM frame of a current snapshot ref. With ref, this is the resolved element; use DOM operations for UI work.",
             json_props! {
-                "script" => obj!("type"="string","description"="JavaScript code")
+                "script" => obj!("type"="string","description"="JavaScript expression; async scripts containing await must return their result"),
+                "ref" => obj!("type"="string","description"="Optional current @N snapshot ref selecting the owning frame; this is that element")
             },
             &["script"],
         ),
@@ -589,6 +635,39 @@ fn browser_tools() -> Vec<ToolDef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_clients_can_fill_every_field_of_each_step_variant() {
+        let schema = browser_exec_tool().input_schema;
+        assert!(schema["anyOf"].is_array());
+        let mut steps = Vec::new();
+        for variant in schema["properties"]["steps"]["items"]["oneOf"]
+            .as_array()
+            .unwrap()
+        {
+            assert_eq!(variant["additionalProperties"], false);
+            let mut step = serde_json::Map::new();
+            for (key, _) in variant["properties"].as_object().unwrap() {
+                let value = match key.as_str() {
+                    "op" => variant["properties"]["op"]["enum"][0].clone(),
+                    "ref" => json!("@1"),
+                    "text" => json!("x"),
+                    "key" => json!("Enter"),
+                    "script" => json!("1 + 1"),
+                    "mode" => json!("insert"),
+                    "clear" | "trusted" => json!(false),
+                    "timeout_ms" => json!(0),
+                    "max_chars" => json!(6000),
+                    "selector" | "until_text" | "completion_prefix" => json!(""),
+                    other => panic!("Provide a compatibility fixture for new field {other}"),
+                };
+                step.insert(key.clone(), value);
+            }
+            steps.push(Value::Object(step));
+        }
+        assert_eq!(steps.len(), 6);
+        crate::tools::browser_sequence::validate_steps(&steps).unwrap();
+    }
     use crate::security::{is_write_tool, is_write_tool_schema, SecurityPolicy};
 
     /// Argument samples exercising each runtime classification branch. For

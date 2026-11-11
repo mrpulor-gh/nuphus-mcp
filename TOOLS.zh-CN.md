@@ -728,25 +728,26 @@ DOM 遍历。`@N` 引用可用于 `browser_click` / `browser_type`。
 
 ### browser_exec
 
-在一次 CDP 往返中执行多步批量脚本。适合表单填写、多步点击工作流。
-脚本使用 `window.__nuphus` 助手（别名为 `h`）：
+一次 MCP 调用执行 1–12 个 UI `steps`，或传旧式 `script`。另一计划存在时兼容空占位 `script:""` / `steps:[]`；两个非空计划会报错。每种动作只声明自身字段。
 
-- `h.click('@N' | 'selector')`
-- `h.fill('@N' | 'selector', text)`
-- `h.scroll(px)`
-- `h.wait(ms)`
-- `h.extract('selector')`
-- `h.snapshot()`
+| 动作 | 字段 |
+|------|------|
+| `type` | `ref`、`text`，可选 `mode`（insert/paste）、`clear`（paste 要求 false） |
+| `press` | `key`，派发前校验快捷键 |
+| `click` | `ref`，可选 `trusted` |
+| `read` | `ref`，可选 `selector`、`until_text` 或 `completion_prefix`、`timeout_ms`、`max_chars` |
+| `evaluate` | `script`，可选 `ref`，空值使用顶层文档 |
+| `snapshot` | 只放末尾，会更新 refs |
 
-| 参数 | 类型 | 必填 | 默认 | 说明 |
-|------|------|------|------|------|
-| `script` | string | **是** | - | 使用 `window.__nuphus` 助手的 JS 脚本（别名为 `h`） |
+整批先校验再执行，共享 15 秒执行预算，连接准备另限 25 秒。失败或未知立即停批，不重放；超时仍保留先前步骤。结果包含 `success`、`status`、`completed_steps`、`attempted_steps`、`skipped_steps` 和逐步 `elapsed_ms`。失败/未知批次（含旧式 script 的错误）同时返回 MCP `isError:true`；中断写入可能已经生效，重试前先核对状态。
 
-**示例**
+`read` 默认 `.xterm-accessibility-tree`、`timeout_ms:0`、`max_chars:6000`，上限为 8000ms / 20000 字符。先在完整可见 DOM 中匹配，再截断返回尾部。`until_text` 是普通子串等待；`completion_prefix` 要求唯一、独立、以换行结束的 prefix+0–255 退出码行，返回 `exit_code`，非零停批。缺失或重复回执为 `unknown`。可见 DOM 不代替完整日志和产物验收。
+
 ```json
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"browser_exec","arguments":{"script":"h.fill('@2', 'alice'); h.click('@5'); h.wait(800); h.snapshot();"}}}
+{"steps":[{"op":"read","ref":"@1","completion_prefix":"TASK_7f3a_RC=","timeout_ms":6000,"max_chars":1800}],"confirm":true}
 ```
-**返回** 每步 `[{op, ref, success, detail}]`。
+
+旧式 `script` 保留 `h.click/fill/scroll/wait/extract/snapshot`，使用顶层选择器和独立引用表。AX 快照 ref 用于 steps，不直接用于旧 helper 引用表。
 
 ---
 
@@ -1009,7 +1010,7 @@ Cookie 数据源；裸装 `nuphus-mcp` 时可能不可用，会返回说明性�
 
 ### browser_upload
 
-使用 DataTransfer 技巧向文件输入元素上传文件。文件必须真实存在于磁盘。
+使用 DataTransfer 技巧向文件输入元素上传文件。文件必须真实存在于磁盘。AX `@N` 按真实 backend node 和所属 frame 定位；目标须为仍连接的 `input[type=file]`，赋值后核对文件名和字节数。成功只证明输入赋值，服务端收件仍需业务验收。
 
 | 参数 | 类型 | 必填 | 默认 | 说明 |
 |------|------|------|------|------|
@@ -1044,7 +1045,7 @@ Cookie 数据源；裸装 `nuphus-mcp` 时可能不可用，会返回说明性�
 
 ### browser_list_downloads
 
-列出浏览器下载目录中的文件。
+列出浏览器下载目录中的文件。目录、条目或元数据读取失败时明确返回错误，不伪装成空列表或零字节文件；列出文件仍需按任务检查完整性和摘要。
 
 | 参数 | 类型 | 必填 | 默认 | 说明 |
 |------|------|------|------|------|

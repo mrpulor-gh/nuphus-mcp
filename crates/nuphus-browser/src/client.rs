@@ -6,6 +6,7 @@
 //! - Login state persistence (--user-data-dir)
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::dom::GetContentQuadsParams;
 use chromiumoxide::cdp::browser_protocol::page::{
     CaptureScreenshotFormat, CaptureScreenshotParams, Viewport as ScreenshotViewport,
 };
@@ -362,9 +363,8 @@ impl Command for DOMDescribeNode {
 }
 
 /// CDP `Input.insertText` — dispatches real text input event to the focused element.
-/// Triggers full event chain (keydown/keypress/beforeinput/input/keyup) that
-/// React/Vue controlled components listen to. Unlike setting `this.value` via JS,
-/// this is indistinguishable from real user typing.
+/// Sends text input, including beforeinput/input events; it does not synthesize
+/// the physical keydown/keyup sequence (use press_key for physical keys).
 #[derive(Debug, Clone, Serialize)]
 struct InputInsertText {
     text: String,
@@ -378,6 +378,39 @@ impl Method for InputInsertText {
 
 impl Command for InputInsertText {
     type Response = serde_json::Value;
+}
+
+/// Native file-only drag payload. The generated CDP type omits empty items;
+/// preserve it explicitly rather than adding a text item (getAsFile() is null).
+#[derive(Debug, Clone, Serialize)]
+struct InputFileDrag {
+    #[serde(rename = "type")]
+    event_type: String,
+    x: f64,
+    y: f64,
+    data: serde_json::Value,
+}
+impl Method for InputFileDrag {
+    fn identifier(&self) -> Cow<'static, str> {
+        "Input.dispatchDragEvent".into()
+    }
+}
+impl Command for InputFileDrag {
+    type Response = serde_json::Value;
+}
+
+#[cfg(test)]
+mod file_drag_payload_tests {
+    use super::InputFileDrag;
+    #[test]
+    fn native_file_drag_keeps_empty_items_without_null_file_placeholder() {
+        let value = serde_json::to_value(InputFileDrag {
+            event_type:"drop".into(), x:1.0, y:2.0,
+            data:serde_json::json!({"items":[],"files":["/test/example.txt"],"dragOperationsMask":1}),
+        }).unwrap();
+        assert_eq!(value["data"]["items"], serde_json::json!([]));
+        assert_eq!(value["data"]["files"][0], "/test/example.txt");
+    }
 }
 
 /// CDP `DOM.enable` — enables DOM agent for querySelector/resolveNode/describeNode.
@@ -636,11 +669,6 @@ const NAVIGATE_DOM_READY_SECS: u64 = 12;
 /// stalls the whole tool for 30s. Wrapping every raw CDP call in [`cdp`] caps
 /// each at this budget and fails fast with a clear error instead.
 const CDP_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-/// Effect-verification window (ms) for `browser_press`: a key that changes
-/// nothing within this window is reported instead of silently passing as
-/// "pressed". Kept short on purpose — many keys are legitimately inert
-/// (arrows on a static page), so a missing reaction is a note, not an error.
-const PRESS_EFFECT_WINDOW_MS: u64 = 2000;
 /// Budget for one page creation round trip. A wedged CDP connection (renderer
 /// replaced mid-navigation, dead browser) must fail fast with a readable error
 /// instead of holding the tool budget until the outer guard fires.
@@ -2104,9 +2132,12 @@ impl BrowserClient {
                 r#"
             (function() {{
                 {scope_prefix}
-                const elements = root.querySelectorAll('a, button, input, textarea, select, [onclick]');
+                const elements = document.querySelectorAll('a, button, input, textarea, select, [onclick]');
                 const results = [];
                 elements.forEach((el, i) => {{
+                    // Preserve the global index used by legacy click/type/center.
+                    // Element.querySelectorAll excludes the scope root itself.
+                    if (root !== document && (el === root || !root.contains(el))) return;
                     const tag = el.tagName.toLowerCase();
                     const text = el.textContent?.trim().substring(0, 60) || '';
                     const type = el.type || '';
@@ -2130,9 +2161,12 @@ impl BrowserClient {
                 r#"
             (function() {{
                 {scope_prefix}
-                const elements = root.querySelectorAll('a, button, input, textarea, select, [onclick]');
+                const elements = document.querySelectorAll('a, button, input, textarea, select, [onclick]');
                 const results = [];
                 elements.forEach((el, i) => {{
+                    // Preserve the global index used by legacy click/type/center.
+                    // Element.querySelectorAll excludes the scope root itself.
+                    if (root !== document && (el === root || !root.contains(el))) return;
                     // Skip hidden / non-visible elements
                     const rect = el.getBoundingClientRect();
                     const style = window.getComputedStyle(el);
@@ -2261,7 +2295,7 @@ impl BrowserClient {
         let (x, y) = self.element_center(&page_guard, selector).await?;
 
         cdp_ctx(
-            "trusted click: mouseMoved failed",
+            &format!("trusted click: mouseMoved at ({x}, {y}) failed"),
             page_guard.execute(DispatchMouseEventParams::new(
                 DispatchMouseEventType::MouseMoved,
                 x,
@@ -2341,16 +2375,33 @@ impl BrowserClient {
                         desc
                     )));
                 }
-                resp.result
-                    .pointer("/result/value")
-                    .and_then(|v| v.as_str())
+                // getBoundingClientRect above is relative to the owning frame.
+                // Input.dispatchMouseEvent needs the main viewport coordinates;
+                // CDP content quads account for iframe offsets and transforms.
+                let quads = cdp_ctx(
+                    "element_center: content quads failed",
+                    page.execute(
+                        GetContentQuadsParams::builder()
+                            .object_id(object_id)
+                            .build(),
+                    ),
+                )
+                .await?;
+                let quad = quads
+                    .result
+                    .quads
+                    .first()
+                    .map(|q| q.inner())
+                    .filter(|q| q.len() == 8)
                     .ok_or_else(|| {
                         BrowserError::Execution(format!(
-                            "element_center: no coordinates returned for {}",
+                            "element_center: no visible content quad for {}",
                             selector
                         ))
-                    })?
-                    .to_string()
+                    })?;
+                let x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4.0;
+                let y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4.0;
+                format!("{},{}", x, y)
             } else if let Some(idx_str) = rest.strip_prefix('e') {
                 // Legacy @eN ref path (rest = "e5" after stripping '@')
                 let idx: usize = idx_str.parse().map_err(|_| {
@@ -2416,79 +2467,68 @@ impl BrowserClient {
         Ok((x, y))
     }
 
-    /// Type text into element (via @N ref from AX snapshot, @eN legacy ref, or CSS selector)
+    /// Replace text (legacy API). MCP callers can explicitly preserve content.
     pub async fn type_text(&self, selector: &str, text: &str) -> Result<String, BrowserError> {
+        self.type_text_with_options(selector, text, true).await
+    }
+
+    /// Deliver text once, verifying receipt in the target's own frame. Never use
+    /// top-level DOM mutations as proof that an iframe terminal accepted input.
+    pub async fn type_text_with_options(
+        &self,
+        selector: &str,
+        text: &str,
+        clear: bool,
+    ) -> Result<String, BrowserError> {
         let page = self.get_page().await?;
         let page_guard = page.lock().await;
-
-        // New AX tree ref: @N
-        if let Some(idx_str) = selector.strip_prefix('@') {
+        let object_id = if let Some(idx_str) = selector.strip_prefix('@') {
             if let Ok(idx) = idx_str.parse::<usize>() {
                 let (backend_id, frame_label) = self.ax_ref(idx)?;
-                return self
-                    .retry_on_stale(|| {
-                        self.type_via_backend_node_id(
-                            &page_guard,
-                            backend_id,
-                            selector,
-                            text,
-                            frame_label,
+                self.resolve_backend_node(&page_guard, backend_id, frame_label)
+                    .await?
+            } else if let Some(idx) = idx_str
+                .strip_prefix('e')
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                let elements =
+                    cdp(page_guard.find_elements("a, button, input, textarea, select, [onclick]"))
+                        .await?;
+                elements
+                    .get(idx)
+                    .ok_or_else(|| {
+                        BrowserError::ElementNotFound(
+                            selector.to_string(),
+                            "legacy ref out of range".to_string(),
                         )
-                    })
-                    .await;
+                    })?
+                    .remote_object_id
+                    .clone()
+            } else {
+                return Err(BrowserError::ElementNotFound(
+                    selector.to_string(),
+                    "invalid ref".to_string(),
+                ));
             }
-        }
-
-        // Legacy @eN ref — focus+clear via JS, then Input.insertText for real input
-        if let Some(idx_str) = selector.strip_prefix("@e") {
-            if let Ok(idx) = idx_str.parse::<usize>() {
-                let js = format!(
-                    r#"(function() {{
-                        const els = document.querySelectorAll('a, button, input, textarea, select, [onclick]');
-                        const i = parseInt({idx});
-                        if (!els[i]) throw new Error('Element @e{idx} not found');
-                        const el = els[i];
-                        el.scrollIntoViewIfNeeded();
-                        el.focus();
-                        el.value = '';
-                        return true;
-                    }})()"#,
-                    idx = idx,
-                );
-                cdp(page_guard.evaluate(js)).await?;
-
-                let input_cmd = InputInsertText {
-                    text: text.to_string(),
-                };
-                cdp_ctx(
-                    &format!("Input.insertText on @e{}", idx),
-                    page_guard.execute(input_cmd),
-                )
-                .await?;
-                return Ok(format!("Typed '{}' into @e{}", text, idx));
-            }
-        }
-
-        // CSS selector — auto-wait (presence + visible), then focus+clear via JS,
-        // then Input.insertText for real input
-        let js = Self::actionability_script(selector, "el.focus(); el.value=''; return true;");
-        cdp_ctx_with_timeout(
-            &format!("Type focus on '{}' failed", selector),
-            ACTIONABILITY_CDP_BUDGET,
-            page_guard.evaluate(js),
-        )
-        .await?;
-
-        let input_cmd = InputInsertText {
-            text: text.to_string(),
+        } else {
+            let js = Self::actionability_script(selector, "return true;");
+            cdp_ctx_with_timeout(
+                "Type target wait failed",
+                ACTIONABILITY_CDP_BUDGET,
+                page_guard.evaluate(js),
+            )
+            .await?;
+            cdp(page_guard.find_element(selector))
+                .await?
+                .remote_object_id
         };
-        cdp_ctx(
-            &format!("Input.insertText on '{}'", selector),
-            page_guard.execute(input_cmd),
-        )
-        .await?;
+        self.type_into_object(&page_guard, object_id, selector, text, clear)
+            .await
+    }
 
-        Ok(format!("Typed '{}' into {}", text, selector))
+    /// Validate a key chord without connecting to a browser or dispatching input.
+    pub fn validate_key_chord(chord: &str) -> Result<(), BrowserError> {
+        parse_key_chord(chord).map(|_| ())
     }
 
     /// Press a physical keyboard key or chord on the currently focused element.
@@ -2542,40 +2582,13 @@ impl BrowserClient {
             .map_err(|e| BrowserError::Execution(format!("keyUp build: {e}")))?;
 
         let page = self.get_page().await?;
-        // Arm the change detector BEFORE dispatching. Without this a key the page
-        // silently drops passes as a successful "Pressed …" — most commonly when
-        // the tab is not the focused/visible one, so CDP input never reaches the
-        // document at all (verified: `document.hasFocus() === false` swallows
-        // `Input.dispatchKeyEvent`). click/type already do this; press must too.
-        // Armed before the page lock is taken: arming itself locks the page.
-        // Best-effort: a detector problem must never block the key dispatch —
-        // it only downgrades the verification below.
-        if let Err(e) = self.arm_change_detector().await {
-            tracing::debug!("[Browser] change detector could not be armed before press: {e}");
-        }
-
         let page_guard = page.lock().await;
         cdp_ctx("keyboard keyDown failed", page_guard.execute(key_down)).await?;
         cdp_ctx("keyboard keyUp failed", page_guard.execute(key_up)).await?;
         drop(page_guard);
 
-        // Effect verification. A missing reaction is a note, not a failure: many
-        // keys are legitimately inert (arrows on a static page). The point is
-        // that the caller learns the difference instead of proceeding on a
-        // false "the key was pressed" premise.
-        let reacted = self
-            .wait_for_change(PRESS_EFFECT_WINDOW_MS)
-            .await
-            .unwrap_or(false);
-        if reacted {
-            return Ok(format!("Pressed {chord}"));
-        }
         Ok(format!(
-            "Pressed {chord}\n\n⚠ No page reaction within {PRESS_EFFECT_WINDOW_MS}ms: the key \
-             was dispatched but nothing changed. Either the key is inert on this page, or the \
-             tab is not the focused/visible one (CDP input is dropped while \
-             `document.hasFocus()` is false). Confirm with browser_snapshot, and use \
-             browser_switch_tab with activate=true only if foreground interaction is needed."
+            "Dispatched {chord}; verify the intended field/terminal state. Key dispatch does not prove command execution."
         ))
     }
 
@@ -2793,54 +2806,78 @@ impl BrowserClient {
         Ok(format!("Clicked {}", displayed))
     }
 
-    /// Type text into an element by its backendNodeId via CDP DOM.resolveNode + Runtime.callFunctionOn.
-    /// Uses a custom CDP command to avoid chromiumoxide's auto-injection of `executionContextId`.
-    async fn type_via_backend_node_id(
+    async fn type_into_object(
         &self,
         page: &Page,
-        backend_node_id: u32,
+        object_id: RemoteObjectId,
         selector: &str,
         text: &str,
-        frame_label: Option<&str>,
+        clear: bool,
     ) -> Result<String, BrowserError> {
-        let displayed = Self::ref_with_frame(selector, frame_label);
-        let object_id = self
-            .resolve_backend_node(page, backend_node_id, frame_label)
-            .await?;
-
-        // Step 1: Focus the target element (scroll into view + clear + focus)
-        let focus_func =
-            "function(){ this.scrollIntoViewIfNeeded(); this.focus(); this.value=''; }";
-        let focus_cmd = RuntimeCallFunctionOn {
-            function_declaration: focus_func.to_string(),
+        let probe = |finish| RuntimeCallFunctionOn {
+            function_declaration: format!(
+                "function(){{ return ({}).call(this, {}, {}); }}",
+                include_str!("type_probe.js"),
+                clear,
+                finish
+            ),
             object_id: Some(object_id.inner().clone()),
             return_by_value: Some(true),
             await_promise: Some(true),
         };
-
-        let focus_resp = cdp_ctx("Type focus failed", page.execute(focus_cmd)).await?;
-
-        if let Some(details) = focus_resp.result.get("exceptionDetails") {
-            let desc = details
-                .get("exception")
-                .and_then(|e| e.get("description"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown exception");
+        let prepared = cdp_ctx("Type focus/probe failed", page.execute(probe(false))).await?;
+        if let Some(details) = prepared.result.get("exceptionDetails") {
             return Err(BrowserError::Execution(format!(
-                "Type JS exception on {}: {}",
-                displayed, desc
+                "Type target {} is not ready: {}",
+                selector, details
             )));
         }
-
-        // Step 2: Use CDP Input.insertText to dispatch real text input.
-        // This triggers the full browser event chain (keydown/keypress/beforeinput/input/keyup),
-        // which React/Vue controlled components require to update their internal state.
-        let input_cmd = InputInsertText {
-            text: text.to_string(),
+        // No retry after dispatch: a lost response must not duplicate terminal input.
+        let dispatched = if text.is_empty() && !clear {
+            Ok(())
+        } else {
+            cdp_ctx(
+                "Input.insertText failed (delivery may be unknown; inspect before retrying)",
+                page.execute(InputInsertText {
+                    text: text.to_string(),
+                }),
+            )
+            .await
+            .map(|_| ())
         };
-        cdp_ctx("Input.insertText failed", page.execute(input_cmd)).await?;
-
-        Ok(format!("Typed '{}' into {}", text, displayed))
+        // Cleanup is attempted even when dispatch fails; a bounded page timer also
+        // cleans up if the transport disconnects before this request arrives.
+        let checked = cdp_ctx(
+            "Type receipt verification failed; inspect before retrying",
+            page.execute(probe(true)),
+        )
+        .await;
+        dispatched?;
+        let checked = checked?;
+        if checked.result.get("exceptionDetails").is_some() {
+            return Err(BrowserError::Execution(format!(
+                "Text dispatched to {} but receipt is unknown; inspect before retrying",
+                selector
+            )));
+        }
+        let received = checked
+            .result
+            .pointer("/result/value")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !text.is_empty() && !received {
+            return Err(BrowserError::Execution(format!(
+                "Text dispatched to {} but no trusted input event reached the target. Input may have been blocked. Inspect the field or terminal before retrying; do not blindly resend.", selector
+            )));
+        }
+        Ok(if text.is_empty() {
+            format!(
+                "Empty text operation on {} (clear={}); inspect current field state",
+                selector, clear
+            )
+        } else {
+            format!("Typed into {}: target received input. This confirms input delivery, not application processing or command execution; verify the field or terminal before the next action.", selector)
+        })
     }
 
     /// Resolve a backendNodeId to a RemoteObjectId via CDP DOM.resolveNode.
@@ -3027,8 +3064,8 @@ impl BrowserClient {
 
     /// Configure Chrome download behavior via CDP `Browser.setDownloadBehavior`.
     async fn configure_download_dir(&mut self) -> Result<(), BrowserError> {
-        let page = self.get_page().await?;
-        let page_guard = page.lock().await;
+        let browser = self.browser.as_ref().ok_or(BrowserError::NotStarted)?;
+        let browser_guard = browser.lock().await;
 
         // Ensure download directory exists
         let _ = std::fs::create_dir_all(&self.download_dir);
@@ -3040,7 +3077,7 @@ impl BrowserClient {
             events_enabled: Some(true),
         };
 
-        match cdp(page_guard.execute(cmd)).await {
+        match cdp(browser_guard.execute(cmd)).await {
             Ok(_) => {
                 tracing::info!("[Browser] Download dir set to: {}", download_path);
                 self.download_configured = true;
@@ -3065,21 +3102,26 @@ impl BrowserClient {
     /// List files in the download directory.
     pub fn list_downloads(&self) -> Result<String, BrowserError> {
         let mut files = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.download_dir) {
-            for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() {
-                        files.push(serde_json::json!({
-                            "name": entry.file_name().to_string_lossy(),
-                            "path": entry.path().to_string_lossy(),
-                            "size": meta.len(),
-                            "modified": meta.modified().ok().map(|t| {
-                                chrono::DateTime::<chrono::Utc>::from(t)
-                                    .format("%Y-%m-%d %H:%M:%S").to_string()
-                            }),
-                        }));
-                    }
-                }
+        let entries = std::fs::read_dir(&self.download_dir).map_err(|error| {
+            BrowserError::Execution(format!(
+                "Failed to list download directory '{}': {}",
+                self.download_dir.display(),
+                error
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(BrowserError::Io)?;
+            let meta = entry.metadata().map_err(BrowserError::Io)?;
+            if meta.is_file() {
+                files.push(serde_json::json!({
+                    "name": entry.file_name().to_string_lossy(),
+                    "path": entry.path().to_string_lossy(),
+                    "size": meta.len(),
+                    "modified": meta.modified().ok().map(|t| {
+                        chrono::DateTime::<chrono::Utc>::from(t)
+                            .format("%Y-%m-%d %H:%M:%S").to_string()
+                    }),
+                }));
             }
         }
         if let Some(warning) = &self.download_config_warning {
@@ -3154,87 +3196,97 @@ impl BrowserClient {
         ))
     }
 
-    /// Upload a file to a file input element using the DataTransfer trick.
-    ///
-    /// Reads the file from disk, base64-encodes it, creates a File object in JS,
-    /// and sets it on the target `<input type="file">` element.
+    /// Upload a file to the exact CSS element or current AX snapshot ref.
+    /// This confirms the input's file metadata, not server-side upload completion.
     pub async fn upload_file(
         &self,
         selector: &str,
         file_path: &str,
     ) -> Result<String, BrowserError> {
+        use base64::Engine;
+        let path = std::path::Path::new(file_path);
+        let metadata = std::fs::metadata(path)?;
+        if !metadata.is_file() {
+            return Err(BrowserError::Execution(format!(
+                "Upload path is not a regular file: {}",
+                path.display()
+            )));
+        }
+        let bytes = std::fs::read(path)?;
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        let mime_type = mime_guess::from_path(file_path).first_or_octet_stream();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let selector_lit = js_string_literal(selector);
+        let name_lit = js_string_literal(file_name);
+        let mime_lit = js_string_literal(mime_type.as_ref());
+
         let page = self.get_page().await?;
         let page_guard = page.lock().await;
-
-        // Read file from disk
-        let path = std::path::Path::new(file_path);
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file")
-            .to_string();
-
-        let data = std::fs::read(path).map_err(BrowserError::Io)?;
-
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-
-        let mime = mime_guess::from_path(path)
-            .first_or_octet_stream()
-            .to_string();
-
-        // JS string literals via serde_json — safe against quotes/backslashes in
-        // the selector or file name (ad-hoc ' escaping was both incomplete and
-        // inconsistent with the rest of the codebase).
-        let selector_lit = js_string_literal(selector);
-        let name_lit = js_string_literal(&file_name);
-        let mime_lit = js_string_literal(&mime);
-
-        let js = format!(
-            r#"(function() {{
-    // Find the file input element
-    let el;
-    const sel = {selector_lit};
-    if (sel.startsWith('@')) {{
-        const idx = parseInt(sel.slice(1)) - 1;
-        const els = document.querySelectorAll('input[type="file"]');
-        if (!els[idx]) throw new Error('File input ' + sel + ' not found');
-        el = els[idx];
-    }} else {{
-        el = document.querySelector(sel);
-        if (!el) throw new Error('File input ' + sel + ' not found');
-    }}
-
-    // Decode base64 to Uint8Array
-    const b64 = '{b64}';
-    const byteChars = atob(b64);
-    const byteArr = new Uint8Array(byteChars.length);
-    for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i);
-
-    // Create File object
-    const file = new File([byteArr], {name_lit}, {{ type: {mime_lit} }});
-
-    // Set via DataTransfer
-    const dt = new DataTransfer();
-    dt.items.add(file);
-    el.files = dt.files;
-    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-
-    return 'Uploaded ' + {name_lit} + ' (' + byteArr.length + ' bytes) to ' + sel;
-}})()"#,
+        let object_id = if let Some(digits) = selector.strip_prefix('@') {
+            let idx = digits.parse::<usize>().map_err(|_| {
+                BrowserError::Execution("Upload ref must be a current @N snapshot ref".into())
+            })?;
+            let (backend_id, frame_label) = self.ax_ref(idx)?;
+            self.resolve_backend_node(&page_guard, backend_id, frame_label)
+                .await?
+        } else {
+            cdp(page_guard.find_element(selector))
+                .await?
+                .remote_object_id
+        };
+        let function_declaration = format!(
+            r#"function() {{
+                const input = this;
+                const selector = {selector_lit};
+                if (!input || input.tagName !== 'INPUT' || input.type !== 'file')
+                    throw new Error('Upload target is not input[type=file]: ' + selector);
+                if (!input.isConnected)
+                    throw new Error('Upload target is detached: ' + selector);
+                const binary = atob('{b64}');
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+                const file = new File([bytes], {name_lit}, {{type: {mime_lit}}});
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                input.files = dt.files;
+                const assigned = input.files;
+                if (!assigned || assigned.length !== 1 || assigned[0].name !== file.name ||
+                    assigned[0].size !== file.size || assigned[0].type !== file.type)
+                    throw new Error('Upload file metadata was not accepted; inspect before retrying: ' + selector);
+                input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                return 'Uploaded ' + {name_lit} + ' (' + bytes.length + ' bytes) to ' + selector;
+            }}"#,
             selector_lit = selector_lit,
             b64 = b64,
             name_lit = name_lit,
-            mime_lit = mime_lit,
+            mime_lit = mime_lit
         );
-
-        let result = cdp(page_guard.evaluate(js)).await?;
-
-        let value: String = result
-            .into_value()
-            .unwrap_or_else(|_| "Upload completed".to_string());
-
-        Ok(value)
+        let response = cdp_ctx(
+            "File input assignment failed; inspect before retrying",
+            page_guard.execute(RuntimeCallFunctionOn {
+                function_declaration,
+                object_id: Some(object_id.inner().clone()),
+                return_by_value: Some(true),
+                await_promise: Some(true),
+            }),
+        )
+        .await?;
+        if let Some(details) = response.result.get("exceptionDetails") {
+            return Err(BrowserError::Execution(format!(
+                "File input assignment failed: {}",
+                details
+            )));
+        }
+        response
+            .result
+            .pointer("/result/value")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                BrowserError::Execution(
+                    "File input assignment result is unknown; inspect before retrying".into(),
+                )
+            })
     }
 
     /// Drag existing local files or directories onto an element using Chrome's
@@ -3245,10 +3297,6 @@ impl BrowserClient {
         selector: &str,
         file_paths: &[String],
     ) -> Result<String, BrowserError> {
-        use chromiumoxide::cdp::browser_protocol::input::{
-            DispatchDragEventParams, DispatchDragEventType, DragData, DragDataItem,
-        };
-
         if file_paths.is_empty() {
             return Err(BrowserError::Execution(
                 "drag_files requires at least one path".to_string(),
@@ -3258,23 +3306,18 @@ impl BrowserClient {
         let page = self.get_page().await?;
         let page_guard = page.lock().await;
         let (x, y) = self.element_center(&page_guard, selector).await?;
-
-        let drag_data = DragData::builder()
-            // Chromium requires the `items` field even for file-only drags; the
-            // generated CDP type omits an empty Vec during serialization.
-            .item(DragDataItem::new("text/plain", ""))
-            .files(file_paths.iter().cloned())
-            .drag_operations_mask(1)
-            .build()
-            .map_err(|e| BrowserError::Execution(format!("drag data build: {e}")))?;
-
-        for event_type in [
-            DispatchDragEventType::DragEnter,
-            DispatchDragEventType::DragOver,
-            DispatchDragEventType::Drop,
-        ] {
-            let event = DispatchDragEventParams::new(event_type, x, y, drag_data.clone());
-            cdp_ctx("file drag event failed", page_guard.execute(event)).await?;
+        let data = serde_json::json!({"items":[],"files":file_paths,"dragOperationsMask":1});
+        for event_type in ["dragEnter", "dragOver", "drop"] {
+            cdp_ctx(
+                "file drag event failed",
+                page_guard.execute(InputFileDrag {
+                    event_type: event_type.into(),
+                    x,
+                    y,
+                    data: data.clone(),
+                }),
+            )
+            .await?;
         }
 
         Ok(format!(
@@ -3439,6 +3482,88 @@ impl BrowserClient {
         let value = result.into_value().unwrap_or(serde_json::Value::Null);
 
         Ok(value)
+    }
+
+    /// Evaluate in the owning DOM frame of an existing snapshot ref. The
+    /// resolved element is `this`; no network transport or page-private API.
+    pub async fn evaluate_at_ref(
+        &self,
+        script: &str,
+        selector: &str,
+    ) -> Result<serde_json::Value, BrowserError> {
+        let idx = selector
+            .strip_prefix('@')
+            .and_then(|s| s.parse::<usize>().ok())
+            .ok_or_else(|| {
+                BrowserError::Execution("evaluate ref must be a current @N snapshot ref".into())
+            })?;
+        let (backend_id, frame_label) = self.ax_ref(idx)?;
+        let page = self.get_page().await?;
+        let page_guard = page.lock().await;
+        let object_id = self
+            .resolve_backend_node(&page_guard, backend_id, frame_label)
+            .await?;
+        let expression = if script.contains("await") {
+            format!("(async () => {{\n{}\n}})()", script)
+        } else {
+            script.to_string()
+        };
+        let quoted = serde_json::to_string(&expression)
+            .map_err(|e| BrowserError::Execution(e.to_string()))?;
+        let response = cdp_ctx(
+            "Frame DOM evaluation failed",
+            page_guard.execute(RuntimeCallFunctionOn {
+                function_declaration: format!("function(){{ return eval({}); }}", quoted),
+                object_id: Some(object_id.inner().clone()),
+                return_by_value: Some(true),
+                await_promise: Some(true),
+            }),
+        )
+        .await?;
+        if let Some(details) = response.result.get("exceptionDetails") {
+            return Err(BrowserError::Execution(format!(
+                "Frame DOM script failed: {}",
+                details
+            )));
+        }
+        Ok(response
+            .result
+            .pointer("/result/value")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Dispatch a normal DOM paste to an existing editable target. Useful for
+    /// terminal widgets that receive insertText but ignore it without key events.
+    pub async fn paste_text_at_ref(
+        &self,
+        selector: &str,
+        text: &str,
+    ) -> Result<String, BrowserError> {
+        let text =
+            serde_json::to_string(text).map_err(|e| BrowserError::Execution(e.to_string()))?;
+        let script = format!(
+            r#"(function() {{
+            const el = this;
+            if (!el.isConnected || el.disabled || el.readOnly || el.closest('[inert]'))
+                throw new Error('Paste target is not editable');
+            if (!el.matches('input,textarea,[contenteditable="true"]'))
+                throw new Error('Paste requires an editable control');
+            el.focus();
+            if (el.getRootNode().activeElement !== el) throw new Error('Paste target is not focused');
+            const data = new DataTransfer(); data.setData('text/plain', {text});
+            const event = new ClipboardEvent('paste', {{clipboardData:data,bubbles:true,cancelable:true}});
+            const handled = !el.dispatchEvent(event);
+            return {{handled}};
+        }}).call(this)"#
+        );
+        self.evaluate_at_ref(&script, selector).await?;
+        // xterm can consume paste without preventDefault. Cancellation is not
+        // application evidence; the following DOM/result check decides success.
+        Ok(format!(
+            "Paste dispatched to {}. Verify application output before proceeding.",
+            selector
+        ))
     }
 
     /// Browser back
@@ -4331,6 +4456,11 @@ fn parse_key_chord(chord: &str) -> Result<(String, i64), BrowserError> {
         "del" => "Delete",
         _ => target,
     };
+    if chromiumoxide::keys::get_key_definition(key).is_none() {
+        return Err(BrowserError::Execution(format!(
+            "unsupported key '{key}' in chord '{chord}'"
+        )));
+    }
     Ok((key.to_string(), modifiers))
 }
 
