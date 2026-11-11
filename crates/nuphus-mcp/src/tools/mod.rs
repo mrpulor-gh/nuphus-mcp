@@ -1,6 +1,7 @@
 //! MCP tool registry: schema exposure + name dispatch execution.
 
 pub mod browser;
+mod browser_sequence;
 pub mod desktop;
 mod schemas;
 pub mod semantic;
@@ -100,8 +101,28 @@ pub async fn execute(name: &str, args: &serde_json::Value) -> Result<ToolOutput,
     drop(file_guard);
     drop(process_guard);
     match result {
-        Ok(text) => Ok(ToolOutput::success(text)),
+        Ok(text) => Ok(output_from_text(name, text)),
         Err(e) => Ok(ToolOutput::failure(e)),
+    }
+}
+
+fn output_from_text(name: &str, text: String) -> ToolOutput {
+    // Only the batch executor owns this envelope. A user's evaluate result may
+    // legitimately contain success:false and is not a tool-level error.
+    let batch_failed = name == "browser_exec"
+        && serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|value| {
+            let failed = |row: &serde_json::Value| {
+                row.get("success").and_then(serde_json::Value::as_bool) == Some(false)
+                    || row.get("success").and_then(serde_json::Value::as_str) == Some("unknown")
+            };
+            value
+                .as_array()
+                .map_or_else(|| failed(&value), |rows| rows.iter().any(failed))
+        });
+    if batch_failed {
+        ToolOutput::failure(text)
+    } else {
+        ToolOutput::success(text)
     }
 }
 
@@ -114,6 +135,30 @@ pub fn has_tool(name: &str) -> bool {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn batch_failures_propagate_to_mcp_without_reinterpreting_page_data() {
+        assert!(
+            output_from_text(
+                "browser_exec",
+                r#"{"success":false,"status":"unknown","steps":[]}"#.into()
+            )
+            .is_error
+        );
+        assert!(!output_from_text("browser_exec", r#"{"success":true}"#.into()).is_error);
+        assert!(!output_from_text("browser_evaluate", r#"{"success":false}"#.into()).is_error);
+        assert!(!output_from_text("browser_exec", "legacy text".into()).is_error);
+        for text in [
+            r#"[{"op":"batch_error","success":false}]"#,
+            r#"[{"op":"batch_truncated","success":"unknown"}]"#,
+            r#"[{"op":"click","success":true},{"op":"fill","success":false}]"#,
+        ] {
+            assert!(output_from_text("browser_exec", text.into()).is_error);
+        }
+        assert!(
+            !output_from_text("browser_exec", r#"[{"op":"click","success":true}]"#.into()).is_error
+        );
+    }
 
     /// Every desktop_* tool registered in schemas must have a dispatch branch in
     /// `tools/desktop.rs` — the desktop counterpart of browser.rs's

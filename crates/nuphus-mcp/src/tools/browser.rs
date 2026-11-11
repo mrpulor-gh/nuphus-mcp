@@ -143,13 +143,40 @@ fn selector_or_ref<'a>(tool: &str, args: &'a Value) -> Result<&'a str, BrowserEr
 
 /// Execute a browser_* tool, returning a text result.
 pub async fn execute(name: &str, args: &Value) -> Result<String, String> {
+    if name == "browser_exec" {
+        if let super::browser_sequence::Plan::Steps(steps) =
+            super::browser_sequence::plan(args).map_err(|e| e.to_string())?
+        {
+            // Connection has its own bound. Once dispatch starts, the sequence
+            // owns the deadline and returns its completed-step journal on expiry.
+            let connection_deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+            let mut guard =
+                tokio::time::timeout_at(connection_deadline, nuphus_browser::get_or_launch(false))
+                    .await
+                    .map_err(|_| {
+                        "Browser connection timed out before sequence dispatch".to_string()
+                    })?
+                    .map_err(|e| format!("browser launch failed before sequence dispatch: {e}"))?;
+            let client = guard
+                .as_mut()
+                .ok_or_else(|| "browser client unavailable before sequence dispatch".to_string())?;
+            return super::browser_sequence::execute(client, steps)
+                .await
+                .map_err(|e| e.to_string());
+        }
+    }
     // Per-operation budget (same policy as the main crate's browser_tools.rs).
     let timeout_secs: u64 = match name {
         "browser_navigate" | "browser_back" | "browser_forward" => 30,
         "browser_exec" => 15,
-        // click/type additionally wait the effect-verification window after the
-        // action, so budget = action timeout + that window.
-        "browser_click" | "browser_type" => 15 + effect_timeout_ms() / 1000,
+        "browser_click"
+            if args
+                .get("observe_change")
+                .and_then(Value::as_bool)
+                .unwrap_or(false) =>
+        {
+            15 + effect_timeout_ms() / 1000
+        }
         "browser_wait_for" => {
             args.get("timeout_ms")
                 .and_then(Value::as_u64)
@@ -276,6 +303,84 @@ async fn run_op_with_reconnect(
 
 /// Execute a single tool operation against the browser. Returns a connection-class error
 /// when the CDP link is dead; `run_op_with_reconnect` turns that into a reconnect + retry.
+#[cfg(test)]
+mod ui_sequence_tests {
+    use super::validate_ui_steps;
+    use serde_json::json;
+
+    #[test]
+    fn validates_whole_sequence_before_dispatch() {
+        assert!(validate_ui_steps(&[]).is_err());
+        assert!(validate_ui_steps(&[
+            json!({"op":"type","ref":"@1","text":"pwd"}),
+            json!({"op":"invalid"})
+        ])
+        .is_err());
+        assert!(validate_ui_steps(&[json!({"op":"press"})]).is_err());
+        assert!(validate_ui_steps(&[
+            json!({"op":"type","ref":"@1","text":"pwd","mode":"unknown"})
+        ])
+        .is_err());
+        assert!(validate_ui_steps(&[json!({"op":"read","ref":"@1","timeout_ms":8001})]).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_tail_before_any_write() {
+        let invalid_tails = [
+            json!({"op":"read","ref":"@1","timeout_ms":-1}),
+            json!({"op":"read","ref":"@1","timeout_ms":"100"}),
+            json!({"op":"read","ref":"@1","max_chars":0}),
+            json!({"op":"read","ref":"@1","max_chars":20001}),
+            json!({"op":"type","ref":"@1","text":"x","clear":"false"}),
+            json!({"op":"type","ref":"@1","text":"x","mode":false}),
+            json!({"op":"click","ref":"@1","trusted":"true"}),
+            json!({"op":"click","ref":"@0"}),
+            json!({"op":"click","ref":"@-1"}),
+            json!({"op":"read","ref":"#terminal"}),
+            json!({"op":"read","ref":"@1","selector":42}),
+            json!({"op":"press","key":"Enter","ref":"@1"}),
+            json!({"op":"snapshot","unexpected":true}),
+        ];
+        for tail in invalid_tails {
+            assert!(
+                validate_ui_steps(&[
+                    json!({"op":"type","ref":"@1","text":"must not be dispatched"}),
+                    tail.clone(),
+                ])
+                .is_err(),
+                "accepted invalid tail: {tail}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_can_only_finish_a_sequence() {
+        assert!(
+            validate_ui_steps(&[json!({"op":"snapshot"}), json!({"op":"click","ref":"@1"}),])
+                .is_err()
+        );
+        assert!(
+            validate_ui_steps(&[json!({"op":"click","ref":"@1"}), json!({"op":"snapshot"}),])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn accepts_bounded_terminal_sequence() {
+        assert!(validate_ui_steps(&[
+            json!({"op":"type","ref":"@1","text":"pwd","mode":"paste","clear":false}),
+            json!({"op":"press","key":"Enter"}),
+            json!({"op":"read","ref":"@1","until_text":"/work","timeout_ms":2000})
+        ])
+        .is_ok());
+    }
+}
+
+#[cfg(test)]
+fn validate_ui_steps(steps: &[Value]) -> Result<(), BrowserError> {
+    super::browser_sequence::validate_steps(steps)
+}
+
 async fn run_op(
     client: &mut BrowserClient,
     name: &str,
@@ -300,15 +405,12 @@ async fn run_op(
             let selector = args.get("selector").and_then(Value::as_str);
             client.snapshot(full, selector).await?
         }
-        "browser_exec" => {
-            let script = args.get("script").and_then(Value::as_str).unwrap_or("");
-            if script.is_empty() {
-                return Err(BrowserError::Execution(
-                    "browser_exec: script parameter is required".to_string(),
-                ));
+        "browser_exec" => match super::browser_sequence::plan(args)? {
+            super::browser_sequence::Plan::Steps(steps) => {
+                super::browser_sequence::execute(client, steps).await?
             }
-            client.batch_exec(script).await?
-        }
+            super::browser_sequence::Plan::Script(script) => client.batch_exec(script).await?,
+        },
         "browser_click" => {
             let selector = selector_or_ref("browser_click", args)?;
             let trusted = args
