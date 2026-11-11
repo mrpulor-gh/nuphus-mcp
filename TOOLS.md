@@ -784,26 +784,26 @@ Accessibility Tree. Outputs `@N [role] "name"` format (e.g. `@1 [button]
 
 ### browser_exec
 
-Execute a multi-step batch script in ONE CDP round trip. Use for form filling
-and multi-click workflows. The script uses `window.__nuphus` helpers aliased as
-`h`:
+Run 1–12 UI `steps` in one MCP call, or supply a legacy `script`. Empty optional fillers (`script:""` / `steps:[]`) are accepted when the other plan is present. Two nonempty plans are rejected. Each step exposes only its own fields.
 
-- `h.click('@N' | 'selector')`
-- `h.fill('@N' | 'selector', text)`
-- `h.scroll(px)`
-- `h.wait(ms)`
-- `h.extract('selector')`
-- `h.snapshot()`
+| Step | Fields |
+|------|--------|
+| `type` | `ref`, `text`, optional `mode` (insert/paste), `clear` (paste requires false) |
+| `press` | `key` (key/chord checked before dispatch) |
+| `click` | `ref`, optional `trusted` |
+| `read` | `ref`, optional `selector`, `until_text` or `completion_prefix`, `timeout_ms`, `max_chars` |
+| `evaluate` | `script`, optional `ref` (empty/omitted uses the top document) |
+| `snapshot` | final step only; refreshes refs |
 
-| Name | Type | Required | Default | Description |
-|------|------|----------|---------|-------------|
-| `script` | string | **yes** | - | JS script using `window.__nuphus` helpers (aliased as `h`) |
+The complete plan is validated before dispatch. Steps share a 15-second execution budget; connection setup is separately bounded at 25 seconds. A failed or uncertain step stops the batch without replay. The result preserves earlier steps and reports `success`, `status`, `completed_steps`, `attempted_steps`, `skipped_steps`, and per-step `elapsed_ms`. Failed/unknown batches, including legacy script errors, set MCP `isError:true`. An interrupted write may have taken effect; inspect state before retrying.
 
-**Example**
+`read` defaults to `.xterm-accessibility-tree`, `timeout_ms:0`, and `max_chars:6000` (limits: 8000ms / 20000 characters). Matching uses the full visible DOM before truncating the returned tail. `until_text` is substring matching. `completion_prefix` requires a unique, independent, newline-terminated line containing the prefix plus a shell exit code 0–255. It returns `exit_code`; nonzero stops the batch. Missing or duplicate receipts are `unknown`. Visible DOM is not a complete log or artifact verification.
+
 ```json
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"browser_exec","arguments":{"script":"h.fill('@2', 'alice'); h.click('@5'); h.wait(800); h.snapshot();"}}}
+{"steps":[{"op":"read","ref":"@1","completion_prefix":"TASK_7f3a_RC=","timeout_ms":6000,"max_chars":1800}],"confirm":true}
 ```
-**Returns** `[{op, ref, success, detail}]` per step.
+
+Legacy `script` retains `h.click/fill/scroll/wait/extract/snapshot`. These helpers use top-document selectors and their own reference list. AX snapshot refs are for `steps`; do not pass them to the legacy helper list.
 
 ---
 

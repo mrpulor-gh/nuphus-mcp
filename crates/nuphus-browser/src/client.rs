@@ -4417,6 +4417,11 @@ fn parse_key_chord(chord: &str) -> Result<(String, i64), BrowserError> {
         "del" => "Delete",
         _ => target,
     };
+    if chromiumoxide::keys::get_key_definition(key).is_none() {
+        return Err(BrowserError::Execution(format!(
+            "unsupported key '{key}' in chord '{chord}'"
+        )));
+    }
     Ok((key.to_string(), modifiers))
 }
 
