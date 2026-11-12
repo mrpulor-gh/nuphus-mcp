@@ -60,6 +60,34 @@ nuphus-mcp/
 5. Open a pull request describing the change and the evidence (build/test
    output).
 
+## Releasing
+
+Releases are cut by pushing an annotated tag; `.github/workflows/release.yml`
+does the rest (version preflight → tests → five platform builds → npm → GitHub
+Release).
+
+```bash
+git tag -a v0.3.5 -m "release: 0.3.5"
+git push origin v0.3.5
+```
+
+npm publishing goes through `scripts/publish-npm-packages.js` — the same code
+the workflow runs, so a local attempt cannot diverge from CI:
+
+```bash
+node scripts/publish-npm-packages.js --dry-run dist/*.tgz   # inspect only
+node scripts/publish-npm-packages.js dist/*.tgz             # publish
+node --test scripts/tests/publish-npm-packages.test.js      # unit tests
+```
+
+Re-running the failed publish job is safe: a tarball whose exact
+`name@version` is already on npm counts as success (verified via `npm view`,
+never inferred from the error text), and the Release step replaces same-named
+assets instead of duplicating them. When it does fail, read the printed
+`npm error code` and request line; the preflight step (`npm whoami`,
+`npm owner ls @nuphus/nuphus-mcp`) already answers whether the token can
+write at all, before any retry burns time.
+
 ## Rules
 
 - **Do not** claim unsupported capabilities: the server only exposes the tools

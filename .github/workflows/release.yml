@@ -248,7 +248,10 @@ jobs:
           src=target/${{ matrix.target }}/release/nuphus-mcp
           if [ "${{ matrix.os }}" = "windows-latest" ]; then src="${src}.exe"; fi
           mkdir -p dist/binary
-          cp "$src" dist/binary/${{ matrix.artifact }}
+          # ".bin" matches the assets already attached to v0.3.4 and keeps the
+          # Release step idempotent: action-gh-release replaces a same-named
+          # asset instead of adding a second copy when the publish job is re-run.
+          cp "$src" dist/binary/${{ matrix.artifact }}.bin
 
       - name: Upload platform artifact
         uses: actions/upload-artifact@v4
@@ -277,56 +280,34 @@ jobs:
           node-version: 20
           registry-url: https://registry.npmjs.org
 
+      # Fail fast and legibly when the publish token is bad: an expired or
+      # wrong-scope token surfaces here as E401/E404 on `npm whoami` instead of
+      # as a mystery 404 on the first `npm publish` a few steps later (0.3.4:
+      # run 42485751946, where `tail -3` truncated the real error and the job
+      # was never re-run, so the cause is still unknown).
+      - name: npm auth preflight
+        run: |
+          set -e
+          echo "node $(node -v) / npm $(npm -v)"
+          echo "registry: $(npm config get registry)"
+          me="$(npm whoami)"
+          echo "authenticated as: $me"
+          owners="$(npm owner ls @nuphus/nuphus-mcp)"
+          echo "maintainers of @nuphus/nuphus-mcp:"
+          echo "$owners"
+          echo "$owners" | grep -q "^$me " || echo "WARN: '$me' is not a maintainer of @nuphus/nuphus-mcp — a publish would be refused; rotate NUPHUS_MCP_NPM to a token of an account that is"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NUPHUS_MCP_NPM }}
+
       - name: Publish platform packages to npm
         working-directory: dist
         run: |
-          set -e
-          # Verify an E409 before treating it as success: the ONLY acceptable
-          # case is "this exact package at this exact version is already live"
-          # (idempotent job re-run). An E409 from anything else — e.g. a stale
-          # platform package versioned behind the meta — must FAIL, never pass
-          # silently (the 0.1.5 ghost-publish failure mode).
-          already_published() {
-            local tgz="$1" base ver pkgname seen
-            base=$(basename "$tgz")
-            ver="${base%.tgz}"; ver="${ver##*-}"
-            pkgname=$(tar -xOzf "$tgz" package/package.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).name))")
-            [ -n "$pkgname" ] || return 1
-            seen=$(npm view "${pkgname}@${ver}" version 2>/dev/null) || true
-            [ "$seen" = "$ver" ]
-          }
-          publish_pkg() {
-            local tgz="$1"
-            for i in 1 2 3 4 5; do
-              local out
-              out=$(npm publish "$tgz" --access public 2>&1) && { echo "OK: $tgz"; return 0; }
-              if echo "$out" | grep -qE "E409|cannot publish over"; then
-                if already_published "$tgz"; then
-                  echo "ALREADY PUBLISHED (verified via npm view): $tgz"; return 0
-                fi
-                echo "E409 but the exact package@version is NOT visible on npm — failing instead of a false success: $tgz"
-                return 1
-              fi
-              # npm's anti-spam heuristics flag rapid-fire NEW package names from
-              # fresh accounts; usually transient → back off and retry.
-              if echo "$out" | grep -qiE "spam detection|triggered spam"; then
-                echo "spam-blocked, retry $i/5: $tgz"; sleep $((i * 12)); continue
-              fi
-              echo "publish failed (attempt $i): $tgz"; echo "$out" | tail -3
-              sleep 10
-            done
-            echo "GAVE UP AFTER RETRIES: $tgz"
-            return 1
-          }
-          # Scoped pack names are <scope>-<name>-<ver>.tgz (e.g.
-          # nuphus-nuphus-mcp-linux-arm64-0.1.0.tgz); dist/ only ever holds the
-          # five platform tarballs, so *.tgz is exact here.
-          for tgz in *.tgz; do
-            publish_pkg "$tgz"
-            # Space new-package creations out: creating several new names in a few
-            # seconds trips npm's spam detection on a new account.
-            sleep 8
-          done
+          # Publish every tarball through the shared script: one failing package
+          # must not hide the fate of the other four, "already published" is
+          # verified against the registry instead of inferred from an error
+          # string, and a failed attempt prints npm's full output (code + method
+          # + URL + body) instead of a three-line tail. Postmortem in the script.
+          node "${{ github.workspace }}/scripts/publish-npm-packages.js" ./*.tgz
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NUPHUS_MCP_NPM }}
 
@@ -345,28 +326,24 @@ jobs:
           mkdir -p "$meta_dist"
           npm pack --pack-destination "$meta_dist" ./npm/packages/nuphus-mcp
           ls -la "$meta_dist"
-          ok=""
-          for tgz in "$meta_dist"/*.tgz; do
-            for i in 1 2 3 4 5; do
-              out=$(npm publish "$tgz" --access public 2>&1) && { echo "OK: $tgz"; ok=1; break; }
-              # E409: only "this exact package@version is already live" counts as
-              # success (idempotent re-run) — verify via npm view, never assume.
-              if echo "$out" | grep -qE "E409|cannot publish over"; then
-                base=$(basename "$tgz"); ver="${base%.tgz}"; ver="${ver##*-}"
-                pkgname=$(tar -xOzf "$tgz" package/package.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).name))")
-                seen=$(npm view "${pkgname}@${ver}" version 2>/dev/null) || true
-                if [ -n "$pkgname" ] && [ "$seen" = "$ver" ]; then
-                  echo "ALREADY PUBLISHED (verified via npm view): ${pkgname}@${ver}"; ok=1; break
-                fi
-                echo "FATAL: E409 but ${pkgname}@${ver} is NOT visible on npm — refusing to treat as success"; exit 1
-              fi
-              if echo "$out" | grep -qiE "spam detection|triggered spam"; then echo "spam-blocked, retry $i/5: $tgz"; sleep $((i * 12)); continue; fi
-              echo "publish failed (attempt $i): $tgz"; echo "$out" | tail -3; sleep 10
-            done
-            [ -n "$ok" ] || { echo "FATAL: could not publish $tgz"; exit 1; }
-          done
+          node scripts/publish-npm-packages.js "$meta_dist"/*.tgz
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NUPHUS_MCP_NPM }}
+
+      # Cheap completeness guard before touching the Release: five platform
+      # tarballs, five raw binaries (named *.bin — see the copy step) and one
+      # meta tarball. A half-empty payload is what makes a "successful" release
+      # useless for anyone downloading it.
+      - name: Verify release payload
+        run: |
+          set -e
+          platform=$(ls dist/*.tgz 2>/dev/null | wc -l)
+          meta=$(ls dist-meta/*.tgz 2>/dev/null | wc -l)
+          binaries=$(ls dist/binary/*.bin 2>/dev/null | wc -l)
+          echo "platform tarballs: $platform / meta tarballs: $meta / raw binaries: $binaries"
+          [ "$platform" -eq 5 ] || { echo "FATAL: expected 5 platform tarballs, found $platform"; exit 1; }
+          [ "$meta" -eq 1 ] || { echo "FATAL: expected 1 meta tarball, found $meta"; exit 1; }
+          [ "$binaries" -eq 5 ] || { echo "FATAL: expected 5 raw binaries, found $binaries"; exit 1; }
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
