@@ -32,14 +32,18 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           set -e
+          # Retry the whole update+install: the ubuntu runner intermittently
+          # fails DNS for azure.archive.ubuntu.com, and a single failed install
+          # used to leave the job red until someone re-ran it by hand.
           for i in 1 2 3; do
-            sudo apt-get update && break || { echo "apt-get update failed (attempt $i), retrying..."; sleep 10; }
+            sudo apt-get update \
+              && sudo apt-get install -y -o Acquire::Retries=5 pkg-config libssl-dev libwayland-dev \
+                libxkbcommon-dev libx11-dev libxcb1-dev libxcb-render0-dev \
+                libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev \
+                libxcb-xkb-dev libxrandr-dev libxi-dev libpipewire-0.3-dev \
+                libgl1-mesa-dev libegl1-mesa-dev libgbm-dev \
+              && break || { echo "apt failed (attempt $i), retrying..."; sleep 15; }
           done
-          sudo apt-get install -y pkg-config libssl-dev libwayland-dev \
-            libxkbcommon-dev libx11-dev libxcb1-dev libxcb-render0-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libxcb-randr0-dev \
-            libxcb-xkb-dev libxrandr-dev libxi-dev libpipewire-0.3-dev \
-            libgl1-mesa-dev libegl1-mesa-dev libgbm-dev
         env:
           DEBIAN_FRONTEND: noninteractive
       - name: Check workspace
